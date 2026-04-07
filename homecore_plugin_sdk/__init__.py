@@ -43,6 +43,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -69,6 +71,10 @@ class PluginBase(ABC):
         self.broker_port = broker_port or int(os.getenv("HC_BROKER_PORT", "1883"))
         self.password = password or os.getenv("HC_PLUGIN_PASSWORD", "")
         self._client: Any = None  # paho.mqtt.client.Client
+        self._started_at: float = time.time()
+        self._management_enabled: bool = False
+        self._config_path: str | None = None
+        self._version: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -246,6 +252,110 @@ class PluginBase(ABC):
         topic = f"homecore/plugins/{self.PLUGIN_ID}/status"
         self._publish(topic, status, qos=1, retain=True)
 
+    def register_device_full(
+        self,
+        device_id: str,
+        name: str,
+        device_type: str | None = None,
+        area: str | None = None,
+        capabilities: dict | None = None,
+    ) -> None:
+        """Register a device with all optional fields.
+
+        Combines the functionality of :meth:`register_device` and
+        :meth:`register_device_typed` into one call with every field optional.
+
+        :param device_id: Stable unique identifier for the device.
+        :param name: Human-readable label.
+        :param device_type: Optional type name from the device-type catalog.
+        :param area: Optional room/zone assignment.
+        :param capabilities: Optional JSON Schema object describing device attributes.
+        """
+        topic = f"homecore/plugins/{self.PLUGIN_ID}/register"
+        msg: dict[str, Any] = {
+            "device_id": device_id,
+            "plugin_id": self.PLUGIN_ID,
+            "name": name,
+        }
+        if device_type is not None:
+            msg["device_type"] = device_type
+        if area is not None:
+            msg["area"] = area
+        if capabilities is not None:
+            msg["capabilities"] = capabilities
+        self._publish(topic, json.dumps(msg), qos=1)
+
+    def register_device_schema(self, device_id: str, schema: dict) -> None:
+        """Publish a device capability schema (retained, QoS 1).
+
+        :param device_id: The target device.
+        :param schema: Dict describing the device's capability schema.
+        """
+        topic = f"homecore/devices/{device_id}/schema"
+        self._publish(topic, json.dumps(schema), qos=1, retain=True)
+
+    def publish_event(self, event_type: str, payload: dict) -> None:
+        """Publish a structured event (QoS 1, not retained).
+
+        :param event_type: The event type key (used as topic suffix).
+        :param payload: Event payload dict, serialized as JSON.
+        """
+        topic = f"homecore/events/{event_type}"
+        self._publish(topic, json.dumps(payload), qos=1, retain=False)
+
+    def enable_management(
+        self,
+        interval_secs: int = 60,
+        version: str | None = None,
+        config_path: str | None = None,
+    ) -> None:
+        """Enable the management protocol (heartbeat + remote commands).
+
+        :param interval_secs: Seconds between heartbeat publishes.
+        :param version: Plugin version string included in heartbeats.
+        :param config_path: Path to a config file for get_config/set_config commands.
+        """
+        self._management_enabled = True
+        self._version = version
+        self._config_path = config_path
+
+        # Subscribe to management commands
+        cmd_topic = f"homecore/plugins/{self.PLUGIN_ID}/manage/cmd"
+        if self._client is not None:
+            self._client.subscribe(cmd_topic, qos=1)
+
+        # Start heartbeat daemon thread
+        def _heartbeat_loop():
+            while True:
+                uptime = time.time() - self._started_at
+                hb = {
+                    "timestamp": self._iso_now(),
+                    "version": self._version,
+                    "uptime_secs": round(uptime),
+                }
+                self._publish(
+                    f"homecore/plugins/{self.PLUGIN_ID}/heartbeat",
+                    json.dumps(hb),
+                    qos=1,
+                    retain=False,
+                )
+                time.sleep(interval_secs)
+
+        t = threading.Thread(target=_heartbeat_loop, daemon=True)
+        t.start()
+
+    def enable_log_forwarding(self, min_level: str = "INFO") -> None:
+        """Attach an MQTT log handler to the root logger.
+
+        Log records at or above *min_level* are published to
+        ``homecore/plugins/{plugin_id}/logs`` as JSON (QoS 0, not retained).
+
+        :param min_level: Minimum log level name (e.g. ``"DEBUG"``, ``"INFO"``).
+        """
+        handler = MqttLogHandler(self)
+        handler.setLevel(getattr(logging, min_level.upper(), logging.INFO))
+        logging.getLogger().addHandler(handler)
+
     # ------------------------------------------------------------------
     # Subclass hooks
     # ------------------------------------------------------------------
@@ -334,6 +444,8 @@ class PluginBase(ABC):
     def _on_message_handler(self, msg: Any) -> None:
         """Route an incoming MQTT message.  Extracted for unit-testability."""
         parts = msg.topic.split("/")
+
+        # Device commands: homecore/devices/{device_id}/cmd
         if (
             len(parts) == 4
             and parts[0] == "homecore"
@@ -346,6 +458,19 @@ class PluginBase(ABC):
             except (json.JSONDecodeError, ValueError):
                 payload = {"raw": msg.payload.decode(errors="replace")}
             self.on_command(device_id, payload)
+            return
+
+        # Management commands: homecore/plugins/{plugin_id}/manage/cmd
+        if (
+            self._management_enabled
+            and len(parts) == 5
+            and parts[0] == "homecore"
+            and parts[1] == "plugins"
+            and parts[2] == self.PLUGIN_ID
+            and parts[3] == "manage"
+            and parts[4] == "cmd"
+        ):
+            self._handle_manage_cmd(msg)
 
     def _publish(self, topic: str, payload: str, qos: int = 0, retain: bool = False) -> None:
         if self._client is None:
@@ -364,7 +489,113 @@ class PluginBase(ABC):
         next_payload["_hc"] = next_hc
         return next_payload
 
+    def _handle_manage_cmd(self, msg: Any) -> None:
+        """Process a management command message."""
+        resp_topic = f"homecore/plugins/{self.PLUGIN_ID}/manage/response"
+        try:
+            payload = json.loads(msg.payload)
+        except (json.JSONDecodeError, ValueError):
+            return
+        action = payload.get("action")
+        request_id = payload.get("request_id")
+
+        if action == "ping":
+            self._publish(
+                resp_topic,
+                json.dumps({"request_id": request_id, "status": "ok"}),
+                qos=1,
+            )
+        elif action == "get_config":
+            if self._config_path:
+                try:
+                    with open(self._config_path, "r") as f:
+                        content = f.read()
+                    self._publish(
+                        resp_topic,
+                        json.dumps({"request_id": request_id, "status": "ok", "content": content}),
+                        qos=1,
+                    )
+                except OSError as exc:
+                    self._publish(
+                        resp_topic,
+                        json.dumps({"request_id": request_id, "status": "error", "error": str(exc)}),
+                        qos=1,
+                    )
+            else:
+                self._publish(
+                    resp_topic,
+                    json.dumps({"request_id": request_id, "status": "error", "error": "no config_path configured"}),
+                    qos=1,
+                )
+        elif action == "set_config":
+            content = payload.get("content", "")
+            if self._config_path:
+                try:
+                    with open(self._config_path, "w") as f:
+                        f.write(content)
+                    self._publish(
+                        resp_topic,
+                        json.dumps({"request_id": request_id, "status": "ok"}),
+                        qos=1,
+                    )
+                except OSError as exc:
+                    self._publish(
+                        resp_topic,
+                        json.dumps({"request_id": request_id, "status": "error", "error": str(exc)}),
+                        qos=1,
+                    )
+            else:
+                self._publish(
+                    resp_topic,
+                    json.dumps({"request_id": request_id, "status": "error", "error": "no config_path configured"}),
+                    qos=1,
+                )
+        elif action == "set_log_level":
+            level_name = payload.get("level", "INFO").upper()
+            level = getattr(logging, level_name, None)
+            if level is not None:
+                logging.getLogger().setLevel(level)
+                self._publish(
+                    resp_topic,
+                    json.dumps({"request_id": request_id, "status": "ok"}),
+                    qos=1,
+                )
+            else:
+                self._publish(
+                    resp_topic,
+                    json.dumps({"request_id": request_id, "status": "error", "error": f"unknown level: {level_name}"}),
+                    qos=1,
+                )
+
     def _iso_now(self) -> str:
         from datetime import datetime, timezone
 
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class MqttLogHandler(logging.Handler):
+    """A :class:`logging.Handler` that publishes log records to MQTT.
+
+    Each record is serialized as a JSON ``LogLine`` and published to
+    ``homecore/plugins/{plugin_id}/logs`` with QoS 0, not retained.
+    """
+
+    def __init__(self, plugin: PluginBase) -> None:
+        super().__init__()
+        self._plugin = plugin
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            from datetime import datetime, timezone
+
+            log_line = {
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "level": record.levelname,
+                "target": record.name,
+                "message": self.format(record) if self.formatter else record.getMessage(),
+                "fields": None,
+            }
+            topic = f"homecore/plugins/{self._plugin.PLUGIN_ID}/logs"
+            self._plugin._publish(topic, json.dumps(log_line), qos=0, retain=False)
+        except Exception:
+            self.handleError(record)
