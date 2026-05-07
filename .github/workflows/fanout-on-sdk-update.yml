@@ -17,11 +17,16 @@ name: Fan out SDK updates
 # (actions:write on each dependent plugin repo).
 
 on:
-  push:
-    branches: [develop]
-    paths:
-      - 'homecore_plugin_sdk/**'
-      - 'pyproject.toml'
+  # push trigger disabled until the first Python plugin lands. With
+  # an empty matrix below, GitHub Actions spawns zero jobs on push
+  # and marks the run as failed (matrix expansion happens before
+  # the `if: vars.FANOUT_ENABLED` gate). When the first Python
+  # plugin lands, restore the push block:
+  #   push:
+  #     branches: [develop]
+  #     paths:
+  #       - 'homecore_plugin_sdk/**'
+  #       - 'pyproject.toml'
   workflow_dispatch: {}
 
 permissions:
