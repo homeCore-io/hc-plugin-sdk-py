@@ -48,6 +48,38 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from .capabilities import Action, Capabilities, Concurrency, ItemOp, RequiresRole
+from .notices import NoticeLevel, PluginNotice, PluginNotices
+from .streaming import StreamContext, StreamTerminated
+
+__all__ = [
+    "PluginBase",
+    "MqttLogHandler",
+    # Notices
+    "PluginNotice",
+    "PluginNotices",
+    "NoticeLevel",
+    # Capability actions
+    "Capabilities",
+    "Action",
+    "Concurrency",
+    "ItemOp",
+    "RequiresRole",
+    # Streaming actions
+    "StreamContext",
+    "StreamTerminated",
+]
+
+#: This SDK's version, reported in every heartbeat. Informational — it tells an
+#: operator which SDK to rebuild against; it is not what core checks
+#: compatibility on.
+SDK_VERSION = "0.2.0"
+
+#: The wire protocol this SDK speaks, which is core's `hc-types` version. Core
+#: compares it against its own to decide whether the two agree on the shape of
+#: a device, an event, and a command.
+PROTOCOL_VERSION = "0.1.5"
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,15 +98,34 @@ class PluginBase(ABC):
         broker_host: str | None = None,
         broker_port: int | None = None,
         password: str | None = None,
+        protocol: int | None = None,
     ) -> None:
         self.broker_host = broker_host or os.getenv("HC_BROKER_HOST", "127.0.0.1")
         self.broker_port = broker_port or int(os.getenv("HC_BROKER_PORT", "1883"))
         self.password = password or os.getenv("HC_PLUGIN_PASSWORD", "")
+        #: MQTT protocol level. ``None`` means 3.1.1, which is what homeCore's
+        #: broker serves on its main port. Only set this if you are pointing at
+        #: the separate v5 port.
+        self.protocol = protocol
         self._client: Any = None  # paho.mqtt.client.Client
         self._started_at: float = time.time()
         self._management_enabled: bool = False
         self._config_path: str | None = None
         self._version: str | None = None
+
+        #: Conditions this plugin is currently reporting about itself. Raised
+        #: and cleared by your code, republished in full on every heartbeat.
+        self.notices = PluginNotices(on_change=self._on_notices_changed)
+
+        # Devices this plugin has registered. Drives the heartbeat's
+        # device_count and, more importantly, decides which command topics we
+        # subscribe to — see _subscribe_device_commands.
+        self._devices: set[str] = set()
+        self._devices_lock = threading.Lock()
+
+        self._capabilities: Capabilities | None = None
+        self._active_streams: dict[str, StreamContext] = {}
+        self._streams_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -185,6 +236,7 @@ class PluginBase(ABC):
             }
         )
         self._publish(topic, payload, qos=1)
+        self._track_device(device_id)
 
     def register_device_typed(
         self,
@@ -219,6 +271,7 @@ class PluginBase(ABC):
             }
         )
         self._publish(topic, payload, qos=1)
+        self._track_device(device_id)
 
     def unregister_device(self, device_id: str) -> None:
         """Retire a device from HomeCore.
@@ -234,6 +287,9 @@ class PluginBase(ABC):
         topic = f"homecore/plugins/{self.PLUGIN_ID}/unregister"
         payload = json.dumps({"device_id": device_id})
         self._publish(topic, payload, qos=1)
+        self.unsubscribe_commands(device_id)
+        with self._devices_lock:
+            self._devices.discard(device_id)
 
     def publish_availability(self, device_id: str, available: bool) -> None:
         """Publish an availability heartbeat (retained, QoS 1).
@@ -284,6 +340,7 @@ class PluginBase(ABC):
         if capabilities is not None:
             msg["capabilities"] = capabilities
         self._publish(topic, json.dumps(msg), qos=1)
+        self._track_device(device_id)
 
     def register_device_schema(self, device_id: str, schema: dict) -> None:
         """Publish a device capability schema (retained, QoS 1).
@@ -293,6 +350,37 @@ class PluginBase(ABC):
         """
         topic = f"homecore/devices/{device_id}/schema"
         self._publish(topic, json.dumps(schema), qos=1, retain=True)
+
+    def subscribe_commands(self, device_id: str) -> None:
+        """Receive commands for one device.
+
+        Every ``register_device*`` call does this for you, so you rarely need
+        it. Reach for it only when homeCore knows about a device this plugin
+        did not register.
+        """
+        self._track_device(device_id)
+
+    def unsubscribe_commands(self, device_id: str) -> None:
+        """Stop receiving commands for one device."""
+        if self._client is not None:
+            self._client.unsubscribe(f"homecore/devices/{device_id}/cmd")
+
+    def subscribe_state(self, device_id: str) -> None:
+        """Receive *state* updates for a device this plugin does not own.
+
+        For cross-device consumers — a thermostat that reads sensors belonging
+        to other plugins. Updates arrive on :meth:`on_state`.
+
+        The broker ACL has to allow it: such a plugin needs
+        ``allow_sub = ["homecore/devices/+/state"]``, which is broader than a
+        typical plugin's.
+        """
+        if self._client is not None:
+            self._client.subscribe(f"homecore/devices/{device_id}/state", qos=1)
+
+    def unsubscribe_state(self, device_id: str) -> None:
+        if self._client is not None:
+            self._client.unsubscribe(f"homecore/devices/{device_id}/state")
 
     def publish_event(self, event_type: str, payload: dict) -> None:
         """Publish a structured event (QoS 1, not retained).
@@ -308,41 +396,99 @@ class PluginBase(ABC):
         interval_secs: int = 60,
         version: str | None = None,
         config_path: str | None = None,
+        capabilities: Capabilities | None = None,
     ) -> None:
-        """Enable the management protocol (heartbeat + remote commands).
+        """Let homeCore supervise this plugin.
 
-        :param interval_secs: Seconds between heartbeat publishes.
-        :param version: Plugin version string included in heartbeats.
-        :param config_path: Path to a config file for get_config/set_config commands.
+        Turns on the heartbeat, the remote management commands (ping, read and
+        write config, change log level), and — if you pass *capabilities* — the
+        action manifest that becomes buttons in the UI.
+
+        Without this a plugin still runs, but homeCore cannot see it properly:
+        no heartbeat means it shows as offline, and none of its actions or
+        notices reach the operator.
+
+        Call it from :meth:`on_connect`.
+
+        :param interval_secs: Seconds between heartbeats. 60 is the norm; core
+            marks a plugin offline after 90 seconds of silence.
+        :param version: Your plugin's version, shown in the UI.
+        :param config_path: Config file to serve for get_config/set_config. In
+            a normal install this is ``sys.argv[1]`` — homeCore owns the file
+            and hands you the path.
+        :param capabilities: Your action manifest. See :class:`Capabilities`.
         """
         self._management_enabled = True
         self._version = version
         self._config_path = config_path
+        if capabilities is not None:
+            capabilities.plugin_id = self.PLUGIN_ID
+            self._capabilities = capabilities
 
-        # Subscribe to management commands
-        cmd_topic = f"homecore/plugins/{self.PLUGIN_ID}/manage/cmd"
         if self._client is not None:
-            self._client.subscribe(cmd_topic, qos=1)
+            self._client.subscribe(
+                f"homecore/plugins/{self.PLUGIN_ID}/manage/cmd", qos=1
+            )
+        self._publish_capabilities()
 
-        # Start heartbeat daemon thread
         def _heartbeat_loop():
             while True:
-                uptime = time.time() - self._started_at
-                hb = {
-                    "timestamp": self._iso_now(),
-                    "version": self._version,
-                    "uptime_secs": round(uptime),
-                }
-                self._publish(
-                    f"homecore/plugins/{self.PLUGIN_ID}/heartbeat",
-                    json.dumps(hb),
-                    qos=1,
-                    retain=False,
-                )
+                self._publish_heartbeat()
                 time.sleep(interval_secs)
 
-        t = threading.Thread(target=_heartbeat_loop, daemon=True)
+        t = threading.Thread(
+            target=_heartbeat_loop, daemon=True, name=f"{self.PLUGIN_ID}-heartbeat"
+        )
         t.start()
+
+    def _on_notices_changed(self) -> None:
+        """Push a heartbeat as soon as the notice set changes.
+
+        Notices ride on the heartbeat, so without this a condition raised just
+        after startup would not reach the UI until the next beat — up to
+        `interval_secs` of the operator looking at a plugin that seems fine.
+        """
+        if self._management_enabled and self._client is not None:
+            self._publish_heartbeat()
+
+    def _publish_heartbeat(self) -> None:
+        with self._devices_lock:
+            device_count = len(self._devices)
+        hb = {
+            "timestamp": self._iso_now(),
+            "version": self._version,
+            "sdk_version": SDK_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "uptime_secs": round(time.time() - self._started_at),
+            "device_count": device_count,
+            # The full current set every beat. Core replaces rather than
+            # merges, so a cleared condition disappears on its own and there is
+            # nothing to expire.
+            "notices": self.notices.to_wire(),
+        }
+        self._publish(
+            f"homecore/plugins/{self.PLUGIN_ID}/heartbeat",
+            json.dumps(hb),
+            qos=1,
+            retain=False,
+        )
+
+    def _publish_capabilities(self) -> None:
+        """Publish the action manifest, retained.
+
+        Retained because homeCore may start, or restart, after this plugin —
+        without it a late-joining core would never learn the plugin has actions
+        until the plugin happened to reconnect.
+        """
+        if self._capabilities is None:
+            return
+        self._capabilities.plugin_id = self.PLUGIN_ID
+        self._publish(
+            f"homecore/plugins/{self.PLUGIN_ID}/capabilities",
+            json.dumps(self._capabilities.to_dict()),
+            qos=1,
+            retain=True,
+        )
 
     def enable_log_forwarding(self, min_level: str = "INFO") -> None:
         """Attach an MQTT log handler to the root logger.
@@ -369,8 +515,38 @@ class PluginBase(ABC):
         """
 
     def on_connect(self) -> None:
-        """Called after the broker connection is established.  Override to
-        register devices and perform startup subscriptions."""
+        """Called once the broker connection is up.
+
+        Register your devices here rather than in ``__init__``, so a reconnect
+        re-registers them. Call :meth:`enable_management` here too.
+        """
+
+    def on_action(
+        self,
+        action: str,
+        params: dict,
+        ctx: StreamContext | None = None,
+    ) -> dict | None:
+        """Handle a capability action you declared in the manifest.
+
+        Return a dict for an immediate action. For a streaming action, *ctx* is
+        a :class:`~homecore_plugin_sdk.streaming.StreamContext` — report
+        through it and return ``None``.
+
+        Returning ``None`` from an *immediate* action tells the SDK you do not
+        recognise the id, and it answers with ``unknown action``.
+
+        Streaming handlers run on their own thread, so blocking here is fine
+        and will not stall the MQTT loop.
+        """
+        return None
+
+    def on_state(self, device_id: str, state: dict) -> None:
+        """A device you subscribed to with :meth:`subscribe_state` changed.
+
+        Only for cross-device consumers. Devices this plugin owns arrive
+        through :meth:`on_command` instead.
+        """
 
     def extract_command_change(self, command_payload: dict) -> dict | None:
         """Extract ``_hc.command`` metadata from a decoded HomeCore command payload."""
@@ -408,7 +584,22 @@ class PluginBase(ABC):
         except ImportError as exc:
             raise ImportError("paho-mqtt is required: pip install paho-mqtt") from exc
 
-        client = mqtt.Client(client_id=self.PLUGIN_ID, protocol=mqtt.MQTTv5)
+        # VERSION2 explicitly. paho 2.x still defaults to VERSION1 for
+        # backwards compatibility, and its callbacks take different arguments —
+        # on_connect gets 4 rather than 5. Without this the connect callback
+        # never fires (so nothing is ever registered) and the first disconnect
+        # raises TypeError out of the network loop.
+        #
+        # MQTT 3.1.1, because homeCore's embedded broker serves v3 on its main
+        # port and v5 on a separate `v5_port`. Connecting as v5 to the ordinary
+        # port is a protocol mismatch: the broker closes the socket and paho
+        # reconnects forever, reporting "Unspecified error". Pass
+        # protocol=MQTTv5 and the v5 port together if you want v5.
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=self.PLUGIN_ID,
+            protocol=self.protocol or mqtt.MQTTv311,
+        )
         self._client = client
 
         if self.password:
@@ -416,8 +607,22 @@ class PluginBase(ABC):
 
         def _on_connect(c, userdata, flags, reason_code, properties):
             if reason_code == 0:
-                logger.info("Connected to broker at %s:%s", self.broker_host, self.broker_port)
-                client.subscribe("homecore/devices/+/cmd", qos=1)
+                logger.info(
+                    "Connected to broker at %s:%s", self.broker_host, self.broker_port
+                )
+                # Re-subscribe to the devices we already knew about. On a
+                # reconnect the broker has forgotten our subscriptions, and
+                # on_connect may register the same devices again — which is
+                # idempotent, but this covers a plugin that registers lazily.
+                with self._devices_lock:
+                    known = list(self._devices)
+                for device_id in known:
+                    client.subscribe(f"homecore/devices/{device_id}/cmd", qos=1)
+                if self._management_enabled:
+                    client.subscribe(
+                        f"homecore/plugins/{self.PLUGIN_ID}/manage/cmd", qos=1
+                    )
+                    self._publish_capabilities()
                 self.on_connect()
             else:
                 logger.error("Broker connection refused: reason_code=%s", reason_code)
@@ -453,11 +658,35 @@ class PluginBase(ABC):
             and parts[3] == "cmd"
         ):
             device_id = parts[2]
+            # Belt and braces alongside the per-device subscription: a broker
+            # that hands us a topic we did not ask for must not turn into this
+            # plugin acting on another plugin's device.
+            with self._devices_lock:
+                owned = device_id in self._devices
+            if not owned:
+                logger.debug("ignoring command for unowned device %s", device_id)
+                return
             try:
                 payload = json.loads(msg.payload)
             except (json.JSONDecodeError, ValueError):
                 payload = {"raw": msg.payload.decode(errors="replace")}
             self.on_command(device_id, payload)
+            return
+
+        # State of a device owned by someone else, for cross-device consumers:
+        # homecore/devices/{device_id}/state
+        if (
+            len(parts) == 4
+            and parts[0] == "homecore"
+            and parts[1] == "devices"
+            and parts[3] == "state"
+        ):
+            try:
+                state = json.loads(msg.payload)
+            except (json.JSONDecodeError, ValueError):
+                return
+            if isinstance(state, dict):
+                self.on_state(parts[2], state)
             return
 
         # Management commands: homecore/plugins/{plugin_id}/manage/cmd
@@ -550,6 +779,31 @@ class PluginBase(ABC):
                     json.dumps({"request_id": request_id, "status": "error", "error": "no config_path configured"}),
                     qos=1,
                 )
+        elif action == "cancel":
+            target = payload.get("target_request_id")
+            with self._streams_lock:
+                ctx = self._active_streams.get(target)
+            if ctx is None:
+                self._respond(
+                    request_id, error="no active stream for target_request_id"
+                )
+            else:
+                ctx._cancel()
+                self._respond(request_id)
+
+        elif action == "respond":
+            target = payload.get("target_request_id")
+            with self._streams_lock:
+                ctx = self._active_streams.get(target)
+            if ctx is None:
+                self._respond(
+                    request_id,
+                    error="no active awaiting_user stream for target_request_id",
+                )
+            else:
+                ctx._deliver_response(payload.get("response") or {})
+                self._respond(request_id)
+
         elif action == "set_log_level":
             level_name = payload.get("level", "INFO").upper()
             level = getattr(logging, level_name, None)
@@ -566,6 +820,134 @@ class PluginBase(ABC):
                     json.dumps({"request_id": request_id, "status": "error", "error": f"unknown level: {level_name}"}),
                     qos=1,
                 )
+
+        else:
+            self._dispatch_action(action, request_id, payload)
+
+    # ------------------------------------------------------------------
+    # Capability actions
+    # ------------------------------------------------------------------
+
+    def _declared_action(self, action_id: str) -> Action | None:
+        if self._capabilities is None:
+            return None
+        for a in self._capabilities.actions:
+            if a.id == action_id:
+                return a
+        return None
+
+    def _dispatch_action(self, action: str, request_id: str, payload: dict) -> None:
+        """Route a management command that is not a built-in to :meth:`on_action`."""
+        declared = self._declared_action(action)
+        # Params are everything that is not protocol envelope.
+        params = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("action", "request_id", "target_request_id")
+        }
+
+        if declared is not None and declared.stream:
+            self._start_stream(declared, request_id, params)
+            return
+
+        try:
+            result = self.on_action(action, params, None)
+        except Exception as exc:  # noqa: BLE001 - a plugin bug must not kill the loop
+            logger.exception("action %s raised", action)
+            self._respond(request_id, error=f"action failed: {exc}")
+            return
+
+        if result is None:
+            self._respond(request_id, error=f"unknown action: {action}")
+        else:
+            self._respond(request_id, extra=result)
+
+    def _start_stream(self, declared: Action, request_id: str, params: dict) -> None:
+        """Run a streaming action on its own thread and answer ``accepted``."""
+        if not request_id:
+            self._respond("", error="streaming action requires request_id")
+            return
+
+        if declared.concurrency is Concurrency.SINGLE:
+            with self._streams_lock:
+                busy = next(
+                    (
+                        rid
+                        for rid, c in self._active_streams.items()
+                        if c.action_id == declared.id
+                    ),
+                    None,
+                )
+            if busy is not None:
+                self._respond(
+                    request_id, status="busy", extra={"active_request_id": busy}
+                )
+                return
+
+        ctx = StreamContext(self, request_id, declared.id)
+        with self._streams_lock:
+            self._active_streams[request_id] = ctx
+
+        def _run() -> None:
+            error: BaseException | None = None
+            try:
+                self.on_action(declared.id, params, ctx)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("streaming action %s raised", declared.id)
+                error = exc
+            finally:
+                # Guarantees exactly one terminal stage even if the handler
+                # returned without emitting one, then clears the retained topic.
+                ctx._finalize(error)
+                with self._streams_lock:
+                    self._active_streams.pop(request_id, None)
+
+        # Distinct prefix so a caller (or a test) can find live action threads
+        # without also matching the heartbeat thread, which never exits.
+        threading.Thread(
+            target=_run, daemon=True, name=f"hc-action-{declared.id}-{request_id}"
+        ).start()
+
+        # Answer immediately; the work continues on the thread above.
+        self._respond(
+            request_id, status="accepted", extra={"stream_topic": ctx.topic}
+        )
+
+    def _respond(
+        self,
+        request_id: str,
+        *,
+        status: str = "ok",
+        error: str | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"request_id": request_id}
+        if error is not None:
+            body["status"] = "error"
+            body["error"] = error
+        else:
+            body["status"] = status
+            if extra:
+                body.update(extra)
+        self._publish(
+            f"homecore/plugins/{self.PLUGIN_ID}/manage/response",
+            json.dumps(body),
+            qos=1,
+        )
+
+    def _track_device(self, device_id: str) -> None:
+        """Record a device as ours and subscribe to its command topic.
+
+        Registration and subscription are one step here on purpose. In the Rust
+        SDK they are separate calls, and forgetting the second is the classic
+        first-plugin bug: the device appears in homeCore, its state updates,
+        and every command silently goes nowhere.
+        """
+        with self._devices_lock:
+            new = device_id not in self._devices
+            self._devices.add(device_id)
+        if new and self._client is not None:
+            self._client.subscribe(f"homecore/devices/{device_id}/cmd", qos=1)
 
     def _iso_now(self) -> str:
         from datetime import datetime, timezone
