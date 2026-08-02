@@ -266,11 +266,28 @@ caused the change, so the UI and the audit log can say so.
 | `on_command(device_id, payload)` | A command for one of your devices |
 | `on_action(action, params, ctx=None)` | A capability action |
 | `on_state(device_id, state)` | A device you subscribed to changed |
+| `on_set_config(config)` | A structured config write |
 
 ## Secrets in logs
 
 `enable_log_forwarding()` publishes to a topic anything can subscribe to. Do
 not interpolate credentials into log messages — the text is forwarded verbatim.
+
+## Remote config
+
+With `config_path` set, homeCore can read and write your config file. The raw
+TOML editor sends text, which the SDK writes verbatim.
+
+If you declare a config schema, the UI renders a form and sends a structured
+object instead. The SDK will not guess at TOML serialisation, so override
+`on_set_config` to take it:
+
+```python
+def on_set_config(self, config):
+    with open(self._config_path, "w") as f:
+        f.write(to_toml(config))
+    return True          # False → the SDK answers with an error
+```
 
 ## Parity with the Rust SDK
 
