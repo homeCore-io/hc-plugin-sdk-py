@@ -1,0 +1,46 @@
+# CI for the Python plugin SDK.
+#
+# Not the reusable hc-scripts workflow — that one is Rust. This is deliberately
+# small: install the package the way a plugin author would, then run the tests.
+#
+# The install step is not ceremony. `pyproject.toml` shipped a build-backend
+# that does not exist (`setuptools.backends.legacy:build`), so `pip install`
+# failed outright and the SDK could not be used at all. Nothing here ran CI, so
+# nobody found out. Installing in CI is what stops that recurring.
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: install + test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml, and current.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package and its dev extras
+        run: python -m pip install --upgrade pip && pip install -e '.[dev]'
+
+      - name: Import it
+        # A package can install and still be unimportable — a bad
+        # packages.find, a module renamed without the manifest following.
+        run: python -c "import homecore_plugin_sdk"
+
+      - name: Tests
+        run: pytest -q tests/
