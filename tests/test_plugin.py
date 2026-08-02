@@ -777,3 +777,102 @@ class TestRemoteConfig(unittest.TestCase):
         )
         self.assertEqual(self._responses(mock)[-1]["status"], "ok")
         self.assertEqual(seen, [{"demo": {"value": 7}}])
+
+
+class TestDevicePersistence(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, ".published-device-ids.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _plugin(self):
+        p = _make_plugin()
+        _attach_mock_client(p)
+        return p
+
+    def test_snapshot_path_is_scoped_to_the_plugin(self):
+        """Real deployments keep every plugin's config in one directory, and
+        every plugin derives this path the same way — unscoped they share one
+        file and retire each other's devices."""
+        from homecore_plugin_sdk.persistence import scoped_snapshot_path
+        hue = scoped_snapshot_path("/cfg/.published-device-ids.json", "plugin.hue")
+        sonos = scoped_snapshot_path("/cfg/.published-device-ids.json", "plugin.sonos")
+        self.assertNotEqual(hue, sonos)
+        self.assertTrue(hue.endswith(".published-device-ids.plugin.hue.json"))
+
+    def test_scoping_is_idempotent(self):
+        from homecore_plugin_sdk.persistence import scoped_snapshot_path
+        once = scoped_snapshot_path("/cfg/.published-device-ids.json", "plugin.hue")
+        twice = scoped_snapshot_path(once, "plugin.hue")
+        self.assertEqual(once, twice)
+
+    def test_registered_devices_are_written_to_disk(self):
+        p = self._plugin()
+        p.enable_device_persistence(self.path)
+        p.register_device_typed("light.01", "One", "light")
+        p.register_device_typed("light.02", "Two", "light")
+
+        scoped = self.path.replace(".json", ".plugin.test.json")
+        with open(scoped) as f:
+            self.assertEqual(json.load(f), ["light.01", "light.02"])
+
+    def test_a_new_process_remembers_the_previous_run(self):
+        first = self._plugin()
+        first.enable_device_persistence(self.path)
+        first.register_device_typed("light.01", "One", "light")
+
+        second = self._plugin()
+        second.enable_device_persistence(self.path)
+        self.assertIn("light.01", second._devices)
+
+    def test_reconcile_unregisters_what_vanished(self):
+        p = self._plugin()
+        p.enable_device_persistence(self.path)
+        p.register_device_typed("light.01", "One", "light")
+        p.register_device_typed("light.02", "Two", "light")
+
+        report = p.reconcile_devices({"light.01"})
+        self.assertEqual(report.stale_unregistered, ["light.02"])
+        self.assertEqual(report.unknown_in_live, [])
+        self.assertNotIn("light.02", p._devices)
+        self.assertIn("light.01", p._devices)
+
+    def test_reconcile_retires_a_device_from_an_earlier_run(self):
+        """The whole point of persisting: a device dropped while the plugin was
+        down is invisible to a fresh process without the snapshot."""
+        first = self._plugin()
+        first.enable_device_persistence(self.path)
+        first.register_device_typed("light.gone", "Gone", "light")
+
+        second = self._plugin()
+        second.enable_device_persistence(self.path)
+        report = second.reconcile_devices(set())
+        self.assertEqual(report.stale_unregistered, ["light.gone"])
+
+    def test_reconcile_reports_ids_it_never_registered(self):
+        p = self._plugin()
+        p.enable_device_persistence(self.path)
+        report = p.reconcile_devices({"light.surprise"})
+        self.assertEqual(report.unknown_in_live, ["light.surprise"])
+        self.assertEqual(report.stale_unregistered, [])
+
+    def test_a_corrupt_snapshot_is_survivable(self):
+        # Losing the snapshot costs reconcile, not the plugin.
+        scoped = self.path.replace(".json", ".plugin.test.json")
+        with open(scoped, "w") as f:
+            f.write("{not json")
+        p = self._plugin()
+        with self.assertLogs("homecore_plugin_sdk", level="WARNING"):
+            p.enable_device_persistence(self.path)
+        p.register_device_typed("light.01", "One", "light")
+        self.assertIn("light.01", p._devices)
+
+    def test_persistence_is_optional(self):
+        p = self._plugin()
+        p.register_device_typed("light.01", "One", "light")
+        self.assertIn("light.01", p._devices)
+        self.assertFalse(os.path.exists(self.path))

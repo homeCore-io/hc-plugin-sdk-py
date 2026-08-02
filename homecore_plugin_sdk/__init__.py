@@ -50,6 +50,7 @@ from typing import Any
 
 from .capabilities import Action, Capabilities, Concurrency, ItemOp, RequiresRole
 from .notices import NoticeLevel, PluginNotice, PluginNotices
+from .persistence import DeviceTracker, ReconcileReport, scoped_snapshot_path
 from .streaming import StreamContext, StreamTerminated
 
 __all__ = [
@@ -68,6 +69,8 @@ __all__ = [
     # Streaming actions
     "StreamContext",
     "StreamTerminated",
+    # Device persistence
+    "ReconcileReport",
 ]
 
 #: This SDK's version, reported in every heartbeat. Informational — it tells an
@@ -118,10 +121,10 @@ class PluginBase(ABC):
         self.notices = PluginNotices(on_change=self._on_notices_changed)
 
         # Devices this plugin has registered. Drives the heartbeat's
-        # device_count and, more importantly, decides which command topics we
-        # subscribe to — see _subscribe_device_commands.
-        self._devices: set[str] = set()
-        self._devices_lock = threading.Lock()
+        # device_count, decides which command topics we subscribe to, and — once
+        # persistence is enabled — survives a restart so reconcile_devices can
+        # tell what has since disappeared.
+        self._devices = DeviceTracker()
 
         self._capabilities: Capabilities | None = None
         self._active_streams: dict[str, StreamContext] = {}
@@ -288,8 +291,7 @@ class PluginBase(ABC):
         payload = json.dumps({"device_id": device_id})
         self._publish(topic, payload, qos=1)
         self.unsubscribe_commands(device_id)
-        with self._devices_lock:
-            self._devices.discard(device_id)
+        self._devices.discard(device_id)
 
     def publish_availability(self, device_id: str, available: bool) -> None:
         """Publish an availability heartbeat (retained, QoS 1).
@@ -364,6 +366,58 @@ class PluginBase(ABC):
         """Stop receiving commands for one device."""
         if self._client is not None:
             self._client.unsubscribe(f"homecore/devices/{device_id}/cmd")
+
+    def enable_device_persistence(self, path: str) -> None:
+        """Remember across restarts which devices this plugin registered.
+
+        Call once at startup, before registering anything. The plugin id is
+        inserted into the filename, so plugins sharing a config directory cannot
+        share a snapshot and retire each other's devices.
+
+        Without this, :meth:`reconcile_devices` can only see devices registered
+        in the *current* process, so anything dropped while the plugin was down
+        lingers in homeCore forever.
+
+        :param path: Typically ``<config_dir>/.published-device-ids.json``.
+        """
+        self._devices.enable_persistence(scoped_snapshot_path(path, self.PLUGIN_ID))
+
+    def reconcile_devices(self, live: set[str]) -> ReconcileReport:
+        """Unregister every device this plugin knows about that is not in *live*.
+
+        The "set what is live this cycle, let the SDK clean up the rest"
+        workflow. Combined with :meth:`enable_device_persistence` it also
+        retires devices registered in earlier runs.
+
+        **Only call this after a sync you trust.** On a partial fetch it will
+        unregister live devices behind a temporarily unreachable upstream. Track
+        an "everything succeeded" flag across your per-source loop and pass the
+        live set only when it holds.
+
+        Ids in *live* that were never registered are reported in
+        ``unknown_in_live`` and otherwise ignored — register them first if you
+        meant to keep them.
+        """
+        known = self._devices.snapshot()
+        stale = sorted(known - live)
+        unknown = sorted(live - known)
+
+        unregistered = []
+        for device_id in stale:
+            try:
+                self.unregister_device(device_id)
+                unregistered.append(device_id)
+                logger.info("unregistered stale device %s", device_id)
+            except Exception as exc:  # noqa: BLE001 - one failure must not stop the rest
+                logger.warning("failed to unregister stale device %s: %s", device_id, exc)
+
+        if unknown:
+            logger.debug(
+                "reconcile_devices saw %d live ids not registered with the SDK; "
+                "register them first if they should be kept",
+                len(unknown),
+            )
+        return ReconcileReport(stale_unregistered=unregistered, unknown_in_live=unknown)
 
     def subscribe_state(self, device_id: str) -> None:
         """Receive *state* updates for a device this plugin does not own.
@@ -452,8 +506,7 @@ class PluginBase(ABC):
             self._publish_heartbeat()
 
     def _publish_heartbeat(self) -> None:
-        with self._devices_lock:
-            device_count = len(self._devices)
+        device_count = len(self._devices)
         hb = {
             "timestamp": self._iso_now(),
             "version": self._version,
@@ -626,9 +679,7 @@ class PluginBase(ABC):
                 # reconnect the broker has forgotten our subscriptions, and
                 # on_connect may register the same devices again — which is
                 # idempotent, but this covers a plugin that registers lazily.
-                with self._devices_lock:
-                    known = list(self._devices)
-                for device_id in known:
+                for device_id in sorted(self._devices.snapshot()):
                     client.subscribe(f"homecore/devices/{device_id}/cmd", qos=1)
                 if self._management_enabled:
                     client.subscribe(
@@ -673,9 +724,7 @@ class PluginBase(ABC):
             # Belt and braces alongside the per-device subscription: a broker
             # that hands us a topic we did not ask for must not turn into this
             # plugin acting on another plugin's device.
-            with self._devices_lock:
-                owned = device_id in self._devices
-            if not owned:
+            if device_id not in self._devices:
                 logger.debug("ignoring command for unowned device %s", device_id)
                 return
             try:
@@ -968,9 +1017,8 @@ class PluginBase(ABC):
         first-plugin bug: the device appears in homeCore, its state updates,
         and every command silently goes nowhere.
         """
-        with self._devices_lock:
-            new = device_id not in self._devices
-            self._devices.add(device_id)
+        new = device_id not in self._devices
+        self._devices.add(device_id)
         if new and self._client is not None:
             self._client.subscribe(f"homecore/devices/{device_id}/cmd", qos=1)
 
