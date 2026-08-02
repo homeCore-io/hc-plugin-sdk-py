@@ -541,6 +541,18 @@ class PluginBase(ABC):
         """
         return None
 
+    def on_set_config(self, config) -> bool:
+        """Accept a structured ``set_config`` payload.
+
+        homeCore sends config as raw text when the operator edits TOML directly,
+        and as an object when your plugin declared a config schema and the UI
+        rendered a form. The SDK writes the text form verbatim; it cannot turn
+        an object into TOML for you, so override this if you declare a schema.
+
+        :returns: ``True`` if you handled and persisted it.
+        """
+        return False
+
     def on_state(self, device_id: str, state: dict) -> None:
         """A device you subscribed to with :meth:`subscribe_state` changed.
 
@@ -735,50 +747,22 @@ class PluginBase(ABC):
                 qos=1,
             )
         elif action == "get_config":
-            if self._config_path:
+            if not self._config_path:
+                self._respond(request_id, error="no config path configured")
+            else:
                 try:
                     with open(self._config_path, "r") as f:
                         content = f.read()
-                    self._publish(
-                        resp_topic,
-                        json.dumps({"request_id": request_id, "status": "ok", "content": content}),
-                        qos=1,
-                    )
+                    # The key is `data`. Core reads resp["data"] and falls back
+                    # to the whole envelope when it is absent, so getting this
+                    # wrong shows the operator {request_id, status, ...} where
+                    # the config should be.
+                    self._respond(request_id, extra={"data": content})
                 except OSError as exc:
-                    self._publish(
-                        resp_topic,
-                        json.dumps({"request_id": request_id, "status": "error", "error": str(exc)}),
-                        qos=1,
-                    )
-            else:
-                self._publish(
-                    resp_topic,
-                    json.dumps({"request_id": request_id, "status": "error", "error": "no config_path configured"}),
-                    qos=1,
-                )
+                    self._respond(request_id, error=str(exc))
+
         elif action == "set_config":
-            content = payload.get("content", "")
-            if self._config_path:
-                try:
-                    with open(self._config_path, "w") as f:
-                        f.write(content)
-                    self._publish(
-                        resp_topic,
-                        json.dumps({"request_id": request_id, "status": "ok"}),
-                        qos=1,
-                    )
-                except OSError as exc:
-                    self._publish(
-                        resp_topic,
-                        json.dumps({"request_id": request_id, "status": "error", "error": str(exc)}),
-                        qos=1,
-                    )
-            else:
-                self._publish(
-                    resp_topic,
-                    json.dumps({"request_id": request_id, "status": "error", "error": "no config_path configured"}),
-                    qos=1,
-                )
+            self._handle_set_config(payload, request_id)
         elif action == "cancel":
             target = payload.get("target_request_id")
             with self._streams_lock:
@@ -823,6 +807,47 @@ class PluginBase(ABC):
 
         else:
             self._dispatch_action(action, request_id, payload)
+
+    def _handle_set_config(self, payload: dict, request_id: str) -> None:
+        """Write a ``set_config`` payload.
+
+        The field is ``config``, not ``content`` — reading the wrong key used to
+        mean an absent value defaulting to ``""``, which **truncated the
+        plugin's config file** on every save.
+
+        Core sends a string when the operator edited raw TOML and an object when
+        the plugin declared a config schema and the UI rendered a form. It also
+        forwards the request body verbatim when that body has no top-level
+        ``config`` key, so the raw editor arrives as ``{"raw": "<text>"}``.
+        Strings are written as-is; anything else is :meth:`on_set_config`'s to
+        handle, because turning an object into TOML is not something this SDK
+        can do for you.
+        """
+        if not self._config_path:
+            self._respond(request_id, error="no config path configured")
+            return
+
+        config = payload.get("config")
+        if isinstance(config, dict) and isinstance(config.get("raw"), str):
+            config = config["raw"]
+
+        if not isinstance(config, str):
+            if self.on_set_config(config):
+                self._respond(request_id)
+            else:
+                self._respond(
+                    request_id,
+                    error="structured config received; override on_set_config(config) "
+                    "to accept it, or edit the raw form instead",
+                )
+            return
+
+        try:
+            with open(self._config_path, "w") as f:
+                f.write(config)
+            self._respond(request_id)
+        except OSError as exc:
+            self._respond(request_id, error=str(exc))
 
     # ------------------------------------------------------------------
     # Capability actions

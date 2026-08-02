@@ -704,3 +704,76 @@ class TestNoticePublishing(unittest.TestCase):
         before = mock.publish.call_count
         plugin.notices.clear("never_raised")
         self.assertEqual(mock.publish.call_count, before)
+
+
+class TestRemoteConfig(unittest.TestCase):
+    """The keys core actually uses. Getting these wrong meant the config editor
+    showed the response envelope, and saving truncated the file."""
+
+    def _plugin(self, tmp_path):
+        plugin = _make_plugin()
+        mock = _attach_mock_client(plugin)
+        plugin._management_enabled = True
+        plugin._config_path = tmp_path
+        return plugin, mock
+
+    def _responses(self, mock):
+        return [
+            json.loads(c[0][1])
+            for c in mock.publish.call_args_list
+            if c[0][0].endswith("/manage/response")
+        ]
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False)
+        self.tmp.write("[demo]\nvalue = 42\n")
+        self.tmp.close()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def test_get_config_answers_with_the_data_key(self):
+        plugin, mock = self._plugin(self.tmp.name)
+        plugin._on_message_handler(_manage_msg("get_config"))
+        resp = self._responses(mock)[-1]
+        self.assertEqual(resp["status"], "ok")
+        self.assertEqual(resp["data"], "[demo]\nvalue = 42\n")
+
+    def test_set_config_writes_the_string_form(self):
+        plugin, mock = self._plugin(self.tmp.name)
+        plugin._on_message_handler(_manage_msg("set_config", config="[demo]\nvalue = 99\n"))
+        self.assertEqual(self._responses(mock)[-1]["status"], "ok")
+        with open(self.tmp.name) as f:
+            self.assertEqual(f.read(), "[demo]\nvalue = 99\n")
+
+    def test_set_config_unwraps_the_raw_form_core_sends(self):
+        """Core forwards the request body when it has no top-level `config`
+        key, so the raw editor arrives as {"raw": "<text>"}."""
+        plugin, mock = self._plugin(self.tmp.name)
+        plugin._on_message_handler(
+            _manage_msg("set_config", config={"raw": "[demo]\nvalue = 7\n"})
+        )
+        self.assertEqual(self._responses(mock)[-1]["status"], "ok")
+        with open(self.tmp.name) as f:
+            self.assertEqual(f.read(), "[demo]\nvalue = 7\n")
+
+    def test_structured_config_is_refused_without_truncating(self):
+        """It used to read the wrong key, default to "", and wipe the file."""
+        plugin, mock = self._plugin(self.tmp.name)
+        plugin._on_message_handler(
+            _manage_msg("set_config", config={"demo": {"value": 7}})
+        )
+        self.assertEqual(self._responses(mock)[-1]["status"], "error")
+        with open(self.tmp.name) as f:
+            self.assertEqual(f.read(), "[demo]\nvalue = 42\n")
+
+    def test_on_set_config_override_takes_over(self):
+        plugin, mock = self._plugin(self.tmp.name)
+        seen = []
+        plugin.on_set_config = lambda cfg: (seen.append(cfg), True)[1]
+        plugin._on_message_handler(
+            _manage_msg("set_config", config={"demo": {"value": 7}})
+        )
+        self.assertEqual(self._responses(mock)[-1]["status"], "ok")
+        self.assertEqual(seen, [{"demo": {"value": 7}}])
