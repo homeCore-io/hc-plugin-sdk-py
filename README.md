@@ -9,10 +9,13 @@ covers the MQTT connection, registration, the management protocol, notices, and
 capability actions.
 
 ```bash
-pip install homecore-plugin-sdk
+pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.2.0
 ```
 
 Requires Python 3.11+.
+
+Not on PyPI yet — install from the tag, which pins you to a known release the
+same way the Rust SDK's git dependency does.
 
 ## Your first plugin
 
