@@ -8,13 +8,33 @@ Subclass `PluginBase`, say what your devices are, handle commands. The SDK
 covers the MQTT connection, registration, the management protocol, notices, and
 capability actions.
 
+## Installing
+
+Requires Python 3.11+.
+
+### Working inside the homeCore workspace
+
+This is the normal case today. If you cloned the whole workspace — `core/`,
+`plugins/`, `sdks/` side by side — install from the checkout. Your plugin then
+picks up SDK edits with no commit, tag, or reinstall in between, which is what
+you want while developing the two together.
+
+```bash
+# from your plugin's directory, e.g. plugins/hc-mything/
+pip install -e ../../sdks/hc-plugin-sdk-py
+```
+
+`-e` is the point: it installs a link to the checkout rather than a copy, so an
+edit in `sdks/hc-plugin-sdk-py` is live in your plugin immediately.
+
+### From a release
+
 ```bash
 pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.2.0
 ```
 
-Requires Python 3.11+.
-
-Not on PyPI yet — install from the tag, which pins you to a known release the
+**Nothing is published to PyPI**, so there is no `pip install
+homecore-plugin-sdk`. Installing from the tag pins you to a known release the
 same way the Rust SDK's git dependency does.
 
 ## Your first plugin
