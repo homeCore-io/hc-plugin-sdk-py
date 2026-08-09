@@ -967,3 +967,47 @@ def test_a_config_with_no_homecore_table_still_builds(tmp_path):
     path = _write_config(tmp_path, "[mine]\nx = 1\n")
     p = _Configured.from_config(path)
     assert p.broker_host  # whatever the default is, it is set
+
+
+# ── device hardware identity ────────────────────────────────────────────────
+# The same facts an HA integration puts in DeviceInfo, so a port carries them
+# across rather than dropping them.
+
+
+class _Hardware(PluginBase):
+    PLUGIN_ID = "plugin.hw"
+
+    def on_command(self, device_id, payload):
+        pass
+
+
+def _registration(plugin):
+    """The payload published to the register topic."""
+    plugin._client = MagicMock()
+    return plugin
+
+
+def test_hardware_fields_ride_along_with_registration():
+    p = _registration(_Hardware())
+    p.register_device(
+        "dev1",
+        "Lamp",
+        {"on": {"type": "boolean"}},
+        manufacturer="Acme",
+        model="A1",
+        sw_version="1.4.2",
+    )
+    sent = json.loads(p._client.publish.call_args[0][1])
+    assert sent["manufacturer"] == "Acme"
+    assert sent["model"] == "A1"
+    assert sent["sw_version"] == "1.4.2"
+
+
+def test_omitted_hardware_is_absent_not_null():
+    """Absent leaves what core already knows alone; null would blank it."""
+    p = _registration(_Hardware())
+    p.register_device("dev1", "Lamp", {"on": {"type": "boolean"}})
+    sent = json.loads(p._client.publish.call_args[0][1])
+    assert "manufacturer" not in sent
+    assert "model" not in sent
+    assert "sw_version" not in sent
