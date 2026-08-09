@@ -308,6 +308,10 @@ class PluginBase(ABC):
         name: str,
         capabilities: dict,
         area: str | None = None,
+        *,
+        manufacturer: str | None = None,
+        model: str | None = None,
+        sw_version: str | None = None,
     ) -> None:
         """Publish a device registration message.
 
@@ -315,8 +319,32 @@ class PluginBase(ABC):
         :param name: Human-readable label.
         :param capabilities: JSON Schema object describing device attributes.
         :param area: Optional room/zone assignment.
+        :param manufacturer: Who made it, as its own system reports it.
+        :param model: What it is.
+        :param sw_version: Firmware, as the device reports it — not any
+            homeCore version.
+
+        The last three are the same facts a Home Assistant integration puts in
+        ``DeviceInfo``, so a port carries them straight across. homeCore acts on
+        none of them; they are there for the operator looking at a device that
+        has stopped working and needing to know which one it is and what it is
+        running.
+
+        Keyword-only and omitted when None: a plugin learns these at different
+        times — a bridge names the manufacturer at discovery and the firmware
+        only after the first poll — and an absent field leaves whatever core
+        already knows alone rather than blanking it.
         """
         topic = f"homecore/plugins/{self.PLUGIN_ID}/register"
+        hardware = {
+            key: value
+            for key, value in (
+                ("manufacturer", manufacturer),
+                ("model", model),
+                ("sw_version", sw_version),
+            )
+            if value
+        }
         payload = json.dumps(
             {
                 "device_id": device_id,
@@ -324,6 +352,7 @@ class PluginBase(ABC):
                 "name": name,
                 "area": area,
                 "capabilities": capabilities,
+                **hardware,
             }
         )
         self._publish(topic, payload, qos=1)
