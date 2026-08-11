@@ -76,7 +76,7 @@ __all__ = [
 #: This SDK's version, reported in every heartbeat. Informational — it tells an
 #: operator which SDK to rebuild against; it is not what core checks
 #: compatibility on.
-SDK_VERSION = "0.2.0"
+SDK_VERSION = "0.3.0"
 
 #: The wire protocol this SDK speaks, which is core's `hc-types` version. Core
 #: compares it against its own to decide whether the two agree on the shape of
@@ -115,6 +115,9 @@ class PluginBase(ABC):
         self._management_enabled: bool = False
         self._config_path: str | None = None
         self._version: str | None = None
+        #: Set by :meth:`from_config`, so :meth:`enable_management` can default
+        #: to the same file rather than making every plugin pass it twice.
+        self._bootstrap_config_path: str | None = None
 
         #: Conditions this plugin is currently reporting about itself. Raised
         #: and cleared by your code, republished in full on every heartbeat.
@@ -133,6 +136,91 @@ class PluginBase(ABC):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @classmethod
+    def from_config(cls, path: str | None = None, **kwargs: Any) -> "PluginBase":
+        """Build a plugin from the config file homeCore hands it.
+
+        **This is how a plugin starts in a real install.** Every homeCore
+        plugin, in every language, receives its config path as ``sys.argv[1]``
+        — core owns that file, seeds it with a minted broker credential, and
+        the operator edits it in the UI. A plugin runtime passes it the same
+        way, as the last argument of its adapter's launch template.
+
+        Without this, every plugin author writes the same twenty lines of
+        tomllib and gets to invent their own bug in it::
+
+            if __name__ == "__main__":
+                MyPlugin.from_config().run()
+
+        The ``[homecore]`` table is what core writes:
+
+        .. code-block:: toml
+
+            [homecore]
+            broker_host = "127.0.0.1"
+            broker_port = 1883
+            plugin_id   = "plugin.my_light"
+            password    = "…"
+
+        Anything else in the file is yours; read it with
+        :meth:`read_own_config` rather than parsing the file twice.
+
+        :param path: Config file. Defaults to ``sys.argv[1]``.
+        :param kwargs: Passed to the constructor, and they win — an explicit
+            argument is someone deliberately overriding the file.
+        :raises SystemExit: with a message naming the contract, when no path
+            was given and ``argv`` has none. A plugin that cannot find its
+            config cannot connect, and the failure it would otherwise produce
+            is a broker auth error nowhere near the cause.
+        """
+        import sys
+        import tomllib
+
+        if path is None:
+            if len(sys.argv) < 2:
+                raise SystemExit(
+                    f"{cls.__name__}: no config file. homeCore passes it as argv[1] — "
+                    f"run this as `python -m your.module <config.toml>`."
+                )
+            path = sys.argv[1]
+
+        try:
+            with open(path, "rb") as f:
+                doc = tomllib.load(f)
+        except FileNotFoundError:
+            raise SystemExit(f"{cls.__name__}: config file not found: {path}") from None
+        except tomllib.TOMLDecodeError as exc:
+            raise SystemExit(f"{cls.__name__}: {path} is not valid TOML: {exc}") from None
+
+        hc = doc.get("homecore", {})
+        settings: dict[str, Any] = {}
+        for key in ("broker_host", "broker_port", "password"):
+            if hc.get(key) is not None:
+                settings[key] = hc[key]
+        settings.update(kwargs)
+
+        plugin = cls(**settings)
+        # Instance attribute, deliberately: core is the authority on a plugin's
+        # id, and one process should not be able to rename the class for
+        # everything else that imports it.
+        if hc.get("plugin_id"):
+            plugin.PLUGIN_ID = hc["plugin_id"]
+        plugin._bootstrap_config_path = path
+        return plugin
+
+    def read_own_config(self) -> dict:
+        """The whole config file this plugin was started with, parsed.
+
+        For plugin-specific settings that live beside ``[homecore]``. Returns
+        an empty dict when the plugin was not built by :meth:`from_config`.
+        """
+        import tomllib
+
+        if not self._bootstrap_config_path:
+            return {}
+        with open(self._bootstrap_config_path, "rb") as f:
+            return tomllib.load(f)
 
     def publish_state(
         self,
@@ -220,6 +308,10 @@ class PluginBase(ABC):
         name: str,
         capabilities: dict,
         area: str | None = None,
+        *,
+        manufacturer: str | None = None,
+        model: str | None = None,
+        sw_version: str | None = None,
     ) -> None:
         """Publish a device registration message.
 
@@ -227,8 +319,32 @@ class PluginBase(ABC):
         :param name: Human-readable label.
         :param capabilities: JSON Schema object describing device attributes.
         :param area: Optional room/zone assignment.
+        :param manufacturer: Who made it, as its own system reports it.
+        :param model: What it is.
+        :param sw_version: Firmware, as the device reports it — not any
+            homeCore version.
+
+        The last three are the same facts a Home Assistant integration puts in
+        ``DeviceInfo``, so a port carries them straight across. homeCore acts on
+        none of them; they are there for the operator looking at a device that
+        has stopped working and needing to know which one it is and what it is
+        running.
+
+        Keyword-only and omitted when None: a plugin learns these at different
+        times — a bridge names the manufacturer at discovery and the firmware
+        only after the first poll — and an absent field leaves whatever core
+        already knows alone rather than blanking it.
         """
         topic = f"homecore/plugins/{self.PLUGIN_ID}/register"
+        hardware = {
+            key: value
+            for key, value in (
+                ("manufacturer", manufacturer),
+                ("model", model),
+                ("sw_version", sw_version),
+            )
+            if value
+        }
         payload = json.dumps(
             {
                 "device_id": device_id,
@@ -236,6 +352,7 @@ class PluginBase(ABC):
                 "name": name,
                 "area": area,
                 "capabilities": capabilities,
+                **hardware,
             }
         )
         self._publish(topic, payload, qos=1)
@@ -474,7 +591,10 @@ class PluginBase(ABC):
         """
         self._management_enabled = True
         self._version = version
-        self._config_path = config_path
+        # Built by from_config? Then the file it read is the file core owns,
+        # and making every plugin name it a second time is one more chance to
+        # name a different one.
+        self._config_path = config_path or self._bootstrap_config_path
         if capabilities is not None:
             capabilities.plugin_id = self.PLUGIN_ID
             self._capabilities = capabilities

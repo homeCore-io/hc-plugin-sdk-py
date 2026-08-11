@@ -12,8 +12,11 @@ name: CI
 on:
   push:
     branches: [main, develop]
+  # Filters the branch a PR merges *into*, not the one it comes from, so this
+  # covers every PR from every branch. `develop` was missing, which meant work
+  # merged there was checked only by the push run afterwards.
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 permissions:
   contents: read

@@ -4,8 +4,11 @@ All tests use unittest.mock to avoid a real MQTT broker.
 """
 import json
 import os
+import sys
 import threading
 import unittest
+
+import pytest
 from unittest.mock import MagicMock, call, patch
 
 from homecore_plugin_sdk import (
@@ -876,3 +879,135 @@ class TestDevicePersistence(unittest.TestCase):
         p.register_device_typed("light.01", "One", "light")
         self.assertIn("light.01", p._devices)
         self.assertFalse(os.path.exists(self.path))
+
+
+# ── from_config: how a plugin actually starts ───────────────────────────────
+# Every homeCore plugin receives its config path as argv[1]. These pin that
+# contract, because getting it wrong surfaces as a broker auth failure a long
+# way from the cause.
+
+
+class _Configured(PluginBase):
+    PLUGIN_ID = "plugin.unset"
+
+    def on_command(self, device_id, payload):
+        pass
+
+
+def _write_config(tmp_path, body):
+    p = tmp_path / "config.toml"
+    p.write_text(body)
+    return str(p)
+
+
+def test_from_config_reads_the_homecore_table(tmp_path):
+    path = _write_config(
+        tmp_path,
+        """
+[homecore]
+broker_host = "10.0.0.5"
+broker_port = 18883
+plugin_id   = "plugin.configured"
+password    = "secret"
+""",
+    )
+    p = _Configured.from_config(path)
+    assert p.broker_host == "10.0.0.5"
+    assert p.broker_port == 18883
+    assert p.password == "secret"
+    assert p.PLUGIN_ID == "plugin.configured"
+
+
+def test_the_id_is_set_on_the_instance_not_the_class(tmp_path):
+    """One process must not rename the class for everything importing it."""
+    path = _write_config(tmp_path, '[homecore]\nplugin_id = "plugin.renamed"\n')
+    _Configured.from_config(path)
+    assert _Configured.PLUGIN_ID == "plugin.unset"
+
+
+def test_explicit_arguments_beat_the_file(tmp_path):
+    path = _write_config(tmp_path, '[homecore]\nbroker_host = "from.file"\n')
+    p = _Configured.from_config(path, broker_host="from.caller")
+    assert p.broker_host == "from.caller"
+
+
+def test_management_defaults_to_the_config_it_was_built_from(tmp_path):
+    """Otherwise get_config/set_config silently serve nothing."""
+    path = _write_config(tmp_path, '[homecore]\nplugin_id = "plugin.x"\n')
+    p = _Configured.from_config(path)
+    p.enable_management()
+    assert p._config_path == path
+
+
+def test_plugin_settings_beside_the_homecore_table_are_readable(tmp_path):
+    path = _write_config(
+        tmp_path,
+        '[homecore]\nplugin_id = "plugin.x"\n\n[mine]\napi_key = "k"\npoll = 30\n',
+    )
+    p = _Configured.from_config(path)
+    assert p.read_own_config()["mine"] == {"api_key": "k", "poll": 30}
+
+
+def test_a_missing_file_says_what_was_expected(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        _Configured.from_config(str(tmp_path / "nope.toml"))
+    assert "not found" in str(exc.value)
+
+
+def test_no_argument_and_no_argv_names_the_contract(monkeypatch):
+    """The message has to say argv[1], because that is the thing to fix."""
+    monkeypatch.setattr(sys, "argv", ["plugin"])
+    with pytest.raises(SystemExit) as exc:
+        _Configured.from_config()
+    assert "argv[1]" in str(exc.value)
+
+
+def test_a_config_with_no_homecore_table_still_builds(tmp_path):
+    """Defaults and env vars remain the fallback; this must not explode."""
+    path = _write_config(tmp_path, "[mine]\nx = 1\n")
+    p = _Configured.from_config(path)
+    assert p.broker_host  # whatever the default is, it is set
+
+
+# ── device hardware identity ────────────────────────────────────────────────
+# The same facts an HA integration puts in DeviceInfo, so a port carries them
+# across rather than dropping them.
+
+
+class _Hardware(PluginBase):
+    PLUGIN_ID = "plugin.hw"
+
+    def on_command(self, device_id, payload):
+        pass
+
+
+def _registration(plugin):
+    """The payload published to the register topic."""
+    plugin._client = MagicMock()
+    return plugin
+
+
+def test_hardware_fields_ride_along_with_registration():
+    p = _registration(_Hardware())
+    p.register_device(
+        "dev1",
+        "Lamp",
+        {"on": {"type": "boolean"}},
+        manufacturer="Acme",
+        model="A1",
+        sw_version="1.4.2",
+    )
+    sent = json.loads(p._client.publish.call_args[0][1])
+    assert sent["manufacturer"] == "Acme"
+    assert sent["model"] == "A1"
+    assert sent["sw_version"] == "1.4.2"
+
+
+def test_omitted_hardware_is_absent_not_null():
+    """Absent leaves what core already knows alone; null would blank it."""
+    p = _registration(_Hardware())
+    p.register_device("dev1", "Lamp", {"on": {"type": "boolean"}})
+    sent = json.loads(p._client.publish.call_args[0][1])
+    assert "manufacturer" not in sent
+    assert "model" not in sent
+    assert "sw_version" not in sent

@@ -5,15 +5,24 @@ Simulates a dimmable light bulb.  On startup it registers with the broker,
 publishes its initial state, then toggles on/off and steps brightness every
 5 seconds.  It also responds to commands received via MQTT.
 
-Usage::
+Started the way homeCore starts every plugin — with its config file as
+``sys.argv[1]``::
 
-    pip install homecore-plugin-sdk
-    python virtual_light.py
-    python virtual_light.py --broker 192.168.1.10 --port 1883 --id plugin.mylight
-    HC_BROKER_HOST=192.168.1.10 python virtual_light.py
+    python virtual_light.py /path/to/config.toml
+
+That is the contract in every language, and it is what a plugin runtime's
+adapter passes as the last argument of its launch template. This example used
+to take ``--broker/--port/--id`` flags instead, which made it a poor thing to
+copy: a plugin built that way cannot be started by core or by a runtime at all.
+
+For local experimentation without core, write the file core would have::
+
+    [homecore]
+    broker_host = "127.0.0.1"
+    broker_port = 1883
+    plugin_id   = "plugin.virtual_py"
 """
 
-import argparse
 import logging
 import threading
 import time
@@ -48,6 +57,12 @@ class VirtualLightPlugin(PluginBase):
     # ------------------------------------------------------------------
 
     def on_connect(self) -> None:
+        # Without this core has no heartbeat from the plugin and shows it as
+        # offline 90 seconds in, however well it is actually working. The
+        # config path comes from from_config(), so get_config/set_config in the
+        # UI edit the same file core seeded.
+        self.enable_management(version="1.0.0")
+
         self.register_device(DEVICE_ID, "Virtual Light (Python)", CAPABILITIES, area="living_room")
         self.publish_availability(DEVICE_ID, True)
 
@@ -92,20 +107,10 @@ class VirtualLightPlugin(PluginBase):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HomeCore virtual light plugin (Python)")
-    parser.add_argument("--broker",   default=None, help="MQTT broker host (default: HC_BROKER_HOST or 127.0.0.1)")
-    parser.add_argument("--port",     type=int, default=None, help="MQTT broker port (default: HC_BROKER_PORT or 1883)")
-    parser.add_argument("--id",       default=None, help="Plugin ID override")
-    parser.add_argument("--password", default=None, help="MQTT password (default: HC_PLUGIN_PASSWORD)")
-    args = parser.parse_args()
-
-    plugin = VirtualLightPlugin(
-        broker_host=args.broker,
-        broker_port=args.port,
-        password=args.password,
-    )
-    if args.id:
-        plugin.PLUGIN_ID = args.id
+    # Reads [homecore] from argv[1] — broker, port, plugin id and the minted
+    # password core seeded — and remembers the path so enable_management can
+    # serve get_config/set_config from the same file.
+    plugin = VirtualLightPlugin.from_config()
 
     logger.info("Virtual light plugin starting")
     logger.info("  Device ID : %s", DEVICE_ID)
