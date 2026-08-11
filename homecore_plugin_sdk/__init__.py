@@ -312,6 +312,7 @@ class PluginBase(ABC):
         manufacturer: str | None = None,
         model: str | None = None,
         sw_version: str | None = None,
+        parent_device_id: str | None = None,
     ) -> None:
         """Publish a device registration message.
 
@@ -323,6 +324,10 @@ class PluginBase(ABC):
         :param model: What it is.
         :param sw_version: Firmware, as the device reports it — not any
             homeCore version.
+        :param parent_device_id: What this device sits behind — a bulb's
+            bridge, a node's controller, one outlet of a strip. Advisory:
+            nothing routes through it, and it must be a device this plugin
+            also registers. Home Assistant calls this ``via_device``.
 
         The last three are the same facts a Home Assistant integration puts in
         ``DeviceInfo``, so a port carries them straight across. homeCore acts on
@@ -342,6 +347,7 @@ class PluginBase(ABC):
                 ("manufacturer", manufacturer),
                 ("model", model),
                 ("sw_version", sw_version),
+                ("parent_device_id", parent_device_id),
             )
             if value
         }
