@@ -43,6 +43,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .alerts import PluginAlertKind
+
 
 class Concurrency(str, Enum):
     """Whether a second invocation may start while the first is running."""
@@ -153,6 +155,11 @@ class Capabilities:
     #: ``config_schema`` for rendering, when you want to control grouping,
     #: labels, and help text rather than let a schema be guessed at.
     config_descriptor: dict | None = None
+    #: The kinds of alert the plugin can raise. Rides on the manifest as
+    #: ``alert_kinds``, so the settings screen can list each — and let someone
+    #: turn it on or off — before it ever happens. Raise them with
+    #: :meth:`~homecore_plugin_sdk.PluginBase.set_alerts`.
+    alert_kinds: list[PluginAlertKind] = field(default_factory=list)
     spec: str = "1"
     plugin_id: str = ""
 
@@ -164,6 +171,8 @@ class Capabilities:
         }
         # These ride on the manifest rather than a topic of their own; core
         # extracts them from this payload.
+        if self.alert_kinds:
+            out["alert_kinds"] = [k.to_dict() for k in self.alert_kinds]
         if self.config_schema is not None:
             out["config_schema"] = self.config_schema
         if self.config_descriptor is not None:

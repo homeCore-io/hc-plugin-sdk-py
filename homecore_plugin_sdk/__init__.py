@@ -48,6 +48,13 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from .alerts import (
+    AlertAction,
+    AlertActionTarget,
+    AlertSeverity,
+    PluginAlert,
+    PluginAlertKind,
+)
 from .capabilities import Action, Capabilities, Concurrency, ItemOp, RequiresRole
 from .notices import NoticeLevel, PluginNotice, PluginNotices
 from .persistence import DeviceTracker, ReconcileReport, scoped_snapshot_path
@@ -60,6 +67,12 @@ __all__ = [
     "PluginNotice",
     "PluginNotices",
     "NoticeLevel",
+    # Alerts
+    "PluginAlert",
+    "PluginAlertKind",
+    "AlertAction",
+    "AlertActionTarget",
+    "AlertSeverity",
     # Capability actions
     "Capabilities",
     "Action",
@@ -76,7 +89,7 @@ __all__ = [
 #: This SDK's version, reported in every heartbeat. Informational — it tells an
 #: operator which SDK to rebuild against; it is not what core checks
 #: compatibility on.
-SDK_VERSION = "0.3.0"
+SDK_VERSION = "0.4.0"
 
 #: The wire protocol this SDK speaks, which is core's `hc-types` version. Core
 #: compares it against its own to decide whether the two agree on the shape of
@@ -128,6 +141,12 @@ class PluginBase(ABC):
         # persistence is enabled — survives a restart so reconcile_devices can
         # tell what has since disappeared.
         self._devices = DeviceTracker()
+
+        # The alerts last published, by topic, so a reconnect can say them
+        # again: core's broker forgets retained messages when it restarts, and
+        # an alert set an hour ago must not vanish because core did.
+        self._alerts: dict[str, str] = {}
+        self._alerts_lock = threading.Lock()
 
         self._capabilities: Capabilities | None = None
         self._active_streams: dict[str, StreamContext] = {}
@@ -312,6 +331,7 @@ class PluginBase(ABC):
         manufacturer: str | None = None,
         model: str | None = None,
         sw_version: str | None = None,
+        parent_device_id: str | None = None,
     ) -> None:
         """Publish a device registration message.
 
@@ -323,6 +343,10 @@ class PluginBase(ABC):
         :param model: What it is.
         :param sw_version: Firmware, as the device reports it — not any
             homeCore version.
+        :param parent_device_id: What this device sits behind — a bulb's
+            bridge, a node's controller, one outlet of a strip. Advisory:
+            nothing routes through it, and it must be a device this plugin
+            also registers. Home Assistant calls this ``via_device``.
 
         The last three are the same facts a Home Assistant integration puts in
         ``DeviceInfo``, so a port carries them straight across. homeCore acts on
@@ -342,6 +366,7 @@ class PluginBase(ABC):
                 ("manufacturer", manufacturer),
                 ("model", model),
                 ("sw_version", sw_version),
+                ("parent_device_id", parent_device_id),
             )
             if value
         }
@@ -418,6 +443,39 @@ class PluginBase(ABC):
         """
         topic = f"homecore/devices/{device_id}/availability"
         self._publish(topic, "online" if available else "offline", qos=1, retain=True)
+
+    def set_alerts(self, device_id: str, alerts: list[PluginAlert]) -> None:
+        """Say which of the plugin's alerts are true of a device now — the
+        whole list; an empty one clears them.
+
+        Each names a kind declared in :attr:`Capabilities.alert_kinds`;
+        homeCore decides whether it is shown and where it is sent. Retained,
+        and said again on every reconnect, so set it when something changes,
+        not on a timer.
+        """
+        self._publish_alerts(f"homecore/devices/{device_id}/alerts", alerts)
+
+    def set_plugin_alerts(self, alerts: list[PluginAlert]) -> None:
+        """The same as :meth:`set_alerts` for the plugin's alerts about itself
+        — a login that expired, a bridge that needs its button pressed."""
+        self._publish_alerts(f"homecore/plugins/{self.PLUGIN_ID}/alerts", alerts)
+
+    def _publish_alerts(self, topic: str, alerts: list[PluginAlert]) -> None:
+        payload = json.dumps([a.to_dict() for a in alerts])
+        with self._alerts_lock:
+            if alerts:
+                self._alerts[topic] = payload
+            else:
+                self._alerts.pop(topic, None)
+        self._publish(topic, payload, qos=1, retain=True)
+
+    def _republish_alerts(self) -> None:
+        """Say the held alerts again: a restarted core's broker has forgotten
+        them."""
+        with self._alerts_lock:
+            held = list(self._alerts.items())
+        for topic, payload in held:
+            self._publish(topic, payload, qos=1, retain=True)
 
     def publish_plugin_status(self, status: str) -> None:
         """Publish plugin status to ``homecore/plugins/{plugin_id}/status`` (retained).
@@ -801,6 +859,7 @@ class PluginBase(ABC):
                 # idempotent, but this covers a plugin that registers lazily.
                 for device_id in sorted(self._devices.snapshot()):
                     client.subscribe(f"homecore/devices/{device_id}/cmd", qos=1)
+                self._republish_alerts()
                 if self._management_enabled:
                     client.subscribe(
                         f"homecore/plugins/{self.PLUGIN_ID}/manage/cmd", qos=1
