@@ -30,9 +30,6 @@ from dataclasses import dataclass, field
 #: The version of the app's ``host`` interface a UI is built against.
 HOST_API = 1
 
-#: The slots the app knows.
-SLOTS = ("plugin.page", "device.panel")
-
 
 class UiError(Exception):
     """Why a folder offers no UI, or why a file can't be served."""
@@ -42,19 +39,26 @@ class UiError(Exception):
 class UiSlot:
     """One place in the app a plugin's component fills.
 
-    ``slot`` is ``plugin.page`` (its page, in place of the generic action list)
-    or ``device.panel`` (its devices' panel, in place of the generic controls);
-    ``element`` the custom element the module defines for it. For
-    ``device.panel``, ``device_types`` limits it to devices of those types —
-    every one of the plugin's devices when empty.
+    ``slot`` names the place (``plugin.page``, ``device.panel``,
+    ``device.card``, ``dashboard.card``, … — which slots exist is homeCore's
+    to say, so this SDK passes any through); ``element`` the custom element
+    the module defines for it. ``device_types`` limits a device slot to
+    devices of those types — every one of the plugin's devices when empty.
+
+    ``extra`` holds every other key the manifest gave the slot (``label``,
+    ``description``, ``forms``, ``settings``, and whatever a newer homeCore
+    adds), passed on to homeCore as declared.
     """
 
     slot: str
     element: str
     device_types: list[str] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        out: dict = {"slot": self.slot, "element": self.element}
+        out: dict = dict(self.extra)
+        out["slot"] = self.slot
+        out["element"] = self.element
         if self.device_types:
             out["device_types"] = list(self.device_types)
         return out
@@ -77,35 +81,6 @@ class PluginUi:
         out["entry"] = self.entry
         out["slots"] = [s.to_dict() for s in self.slots]
         return out
-
-    def validated(self) -> "PluginUi | None":
-        """Whether it can be offered at all: a version, a module inside the
-        folder, and at least one slot the app knows, each naming a valid
-        custom element. Slots that don't pass are dropped; ``None`` when none
-        is left."""
-        if (
-            not self.version.strip()
-            or not relative_path(self.entry)
-            or not all(_ascii_alnum(c) for c in self.build)
-        ):
-            return None
-        slots = [s for s in self.slots if s.slot in SLOTS and _custom_element(s.element)]
-        if not slots:
-            return None
-        return PluginUi(self.host_api, self.version, self.build, self.entry, slots)
-
-
-def _ascii_alnum(c: str) -> bool:
-    return ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9")
-
-
-def _custom_element(name: str) -> bool:
-    """A custom element name: lowercase, starting with a letter, with a hyphen."""
-    return (
-        "-" in name
-        and "a" <= name[:1] <= "z"
-        and all(("a" <= c <= "z") or ("0" <= c <= "9") or c in "-._" for c in name)
-    )
 
 
 def relative_path(p: str) -> bool:
@@ -182,7 +157,8 @@ def _slot_from(v: object) -> UiSlot:
         raise UiError("manifest.json: a slot needs `slot` and `element` strings")
     if not isinstance(types, list) or not all(isinstance(t, str) for t in types):
         raise UiError("manifest.json: `device_types` must be a list of strings")
-    return UiSlot(slot, element, list(types))
+    extra = {k: x for k, x in v.items() if k not in ("slot", "element", "device_types")}
+    return UiSlot(slot, element, list(types), extra)
 
 
 def load(directory: str, version: str) -> PluginUi:
@@ -211,16 +187,20 @@ def load(directory: str, version: str) -> PluginUi:
     slots = [_slot_from(s) for s in slots_raw]
     if not os.path.isfile(os.path.join(directory, entry)):
         raise UiError(f"its entry {entry} isn't there")
-    ui = PluginUi(
+    # Which slots exist is homeCore's to say, not this SDK's: an SDK older than
+    # a slot would otherwise keep a plugin from ever offering it. Only what is
+    # wrong whatever the slot is refused here; every slot goes on as declared.
+    if not slots:
+        raise UiError("it declares nowhere the app can put it")
+    if not version.strip() or not relative_path(entry):
+        raise UiError("its version or entry isn't usable")
+    return PluginUi(
         host_api=m["host_api"],
         version=version,
         build=build_of(directory),
         entry=entry,
         slots=slots,
-    ).validated()
-    if ui is None:
-        raise UiError("it declares nowhere the app can put it")
-    return ui
+    )
 
 
 def _walk(root: str, d: str, out: list[str]) -> None:

@@ -324,6 +324,9 @@ The SDK declares them on the manifest (`ui`, with a hash of the files as their
 the web app and keeps none. A plugin with screens and no actions still
 publishes its manifest. A folder that isn't there, or declares nowhere the app
 can put it, is said in the log and skipped — the app shows its generic screens.
+Every slot goes on as declared, extra fields (`label`, `forms`, `settings`, …)
+included: which slots exist is homeCore's to decide, so the SDK never keeps a
+plugin from offering one newer than itself.
 Each element is handed the app's `host` — the plugin's devices, commands,
 actions, settings and the app's look; its types are `core/sdk/ui`
 (`@homecore/plugin-ui`). `plugins/hc-ecowitt/ui` in core is a complete one.

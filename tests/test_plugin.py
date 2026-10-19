@@ -1268,25 +1268,43 @@ def test_a_folder_without_its_entry_or_a_manifest_offers_nothing(tmp_path):
         hc_ui.load(str(tmp_path), "1")
 
 
-def test_a_ui_keeps_the_slots_the_app_knows_and_drops_the_rest():
-    ui = hc_ui.PluginUi(
-        host_api=1,
-        version="0.1.18",
-        slots=[
-            hc_ui.UiSlot("plugin.page", "hc-ecowitt-page"),
-            hc_ui.UiSlot("device.panel", "hc-ecowitt-station", ["weather_station"]),
-            hc_ui.UiSlot("dashboard.card", "hc-ecowitt-card"),
-            hc_ui.UiSlot("plugin.page", "NoHyphen"),
-        ],
-    ).validated()
-    assert ui is not None and len(ui.slots) == 2
-    assert ui.slots[1].device_types == ["weather_station"]
-    page = [hc_ui.UiSlot("plugin.page", "hc-x-page")]
-    assert hc_ui.PluginUi(1, "1.0.0", entry="index.js", slots=page).validated()
-    assert hc_ui.PluginUi(1, "1.0.0", entry="../index.js", slots=page).validated() is None
-    assert hc_ui.PluginUi(1, "1.0.0", entry="/etc/index.js", slots=page).validated() is None
-    assert hc_ui.PluginUi(1, " ", slots=page).validated() is None
-    assert hc_ui.PluginUi(1, "1.0.0", slots=[]).validated() is None
+def test_every_slot_is_passed_on_as_declared_unknown_ones_and_fields_included(tmp_path):
+    """Which slots exist is homeCore's to say: an SDK that dropped the ones it
+    doesn't know would keep a plugin from ever offering a newer one."""
+    later = {"slot": "future.slot", "element": "hc-x-later"}
+    card = {
+        "slot": "dashboard.card",
+        "element": "hc-x-card",
+        "label": "Quick presets",
+        "description": "One tap to a preset",
+        "forms": ["compact", "large"],
+        "settings": "hc-x-card-settings",
+        "someday": {"nested": True},
+    }
+    panel = {"slot": "device.panel", "element": "hc-x-panel", "device_types": ["light"]}
+    odd = {"slot": "plugin.page", "element": "NoHyphen"}
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"host_api": 1, "slots": [later, card, panel, odd]})
+    )
+    (tmp_path / "index.js").write_text("export {}")
+    got = hc_ui.load(str(tmp_path), "1.0.0").to_dict()["slots"]
+    assert got == [later, card, panel, odd]
+
+
+def test_an_unusable_version_or_entry_offers_nothing(tmp_path):
+    d = _ui_folder(tmp_path)
+    with pytest.raises(hc_ui.UiError, match="version or entry"):
+        hc_ui.load(d, " ")
+    (tmp_path / "manifest.json").write_text(
+        '{"host_api":1,"entry":"./index.js","slots":[{"slot":"plugin.page","element":"hc-x-page"}]}'
+    )
+    assert hc_ui.load(d, "1").entry == "./index.js"
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "manifest.json").write_text(
+        '{"host_api":1,"entry":"../index.js","slots":[{"slot":"plugin.page","element":"hc-x-page"}]}'
+    )
+    with pytest.raises(hc_ui.UiError, match="version or entry"):
+        hc_ui.load(str(tmp_path / "sub"), "1")
 
 
 def test_the_manifest_ui_is_the_rust_wire_form():
