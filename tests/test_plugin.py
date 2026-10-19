@@ -1011,3 +1011,211 @@ def test_omitted_hardware_is_absent_not_null():
     assert "manufacturer" not in sent
     assert "model" not in sent
     assert "sw_version" not in sent
+
+
+# ── alerts ──────────────────────────────────────────────────────────────────
+#
+# What a plugin says needs attention about its devices. The wire shape is
+# core's `hc_types::alert::PluginAlert` / `PluginAlertKind`; these pin it.
+
+from datetime import datetime, timezone  # noqa: E402
+import types  # noqa: E402
+
+from homecore_plugin_sdk import (  # noqa: E402
+    AlertAction,
+    AlertActionTarget,
+    AlertSeverity,
+    PluginAlert,
+    PluginAlertKind,
+)
+
+
+def _published(mock: MagicMock) -> list[tuple[str, str, bool]]:
+    return [(c[0][0], c[0][1], c[1]["retain"]) for c in mock.publish.call_args_list]
+
+
+def test_a_bare_alert_carries_only_topic_and_reason():
+    assert PluginAlert("firmware_update", "Firmware 17.0.0 is out").to_dict() == {
+        "topic": "firmware_update",
+        "reason": "Firmware 17.0.0 is out",
+    }
+
+
+def test_a_full_alert_matches_the_rust_wire_form():
+    alert = PluginAlert(
+        "firmware_update",
+        "Firmware 17.0.0 is out",
+        key="17.0.0",
+        message="Kitchen strip: firmware 17.0.0 is out",
+        severity=AlertSeverity.INFO,
+        action=AlertAction(
+            "Update…",
+            "install_firmware",
+            params={"version": "17.0.0"},
+            confirm=True,
+        ),
+        since=datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    assert alert.to_dict() == {
+        "topic": "firmware_update",
+        "key": "17.0.0",
+        "reason": "Firmware 17.0.0 is out",
+        "message": "Kitchen strip: firmware 17.0.0 is out",
+        "severity": "info",
+        # target is omitted when it is the default, `device`.
+        "action": {
+            "label": "Update…",
+            "id": "install_firmware",
+            "params": {"version": "17.0.0"},
+            "confirm": True,
+        },
+        "since": "2026-10-19T12:00:00Z",
+    }
+
+
+def test_an_action_omits_target_params_and_confirm_by_default():
+    assert AlertAction("Re-pair", "pair").to_dict() == {"label": "Re-pair", "id": "pair"}
+
+
+def test_a_plugin_target_is_spelled_out():
+    action = AlertAction("Sign in", "login", target=AlertActionTarget.PLUGIN)
+    assert action.to_dict() == {"label": "Sign in", "id": "login", "target": "plugin"}
+
+
+def test_a_naive_since_is_taken_as_utc():
+    alert = PluginAlert("t", "r", since=datetime(2026, 1, 2, 3, 4, 5))
+    assert alert.to_dict()["since"] == "2026-01-02T03:04:05Z"
+
+
+def test_an_alert_kind_always_carries_severity_and_default_on():
+    assert PluginAlertKind("bridge_button", "Bridge needs its button pressed").to_dict() == {
+        "topic": "bridge_button",
+        "label": "Bridge needs its button pressed",
+        "severity": "warning",
+        "default_on": True,
+    }
+    news = PluginAlertKind(
+        "firmware_update",
+        "Firmware update available",
+        description="A newer firmware is published.",
+        severity=AlertSeverity.INFO,
+        default_on=False,
+    )
+    assert news.to_dict() == {
+        "topic": "firmware_update",
+        "label": "Firmware update available",
+        "description": "A newer firmware is published.",
+        "severity": "info",
+        "default_on": False,
+    }
+
+
+def test_alert_kinds_ride_on_the_manifest():
+    plugin = _make_plugin()
+    mock = _attach_mock_client(plugin)
+    plugin.enable_management(
+        interval_secs=3600,
+        capabilities=Capabilities(
+            alert_kinds=[PluginAlertKind("firmware_update", "Firmware update available")]
+        ),
+    )
+    (manifest,) = [
+        json.loads(p)
+        for t, p, retain in _published(mock)
+        if t == "homecore/plugins/plugin.test/capabilities" and retain
+    ]
+    assert manifest["actions"] == []
+    assert manifest["alert_kinds"] == [
+        {
+            "topic": "firmware_update",
+            "label": "Firmware update available",
+            "severity": "warning",
+            "default_on": True,
+        }
+    ]
+
+
+def test_a_manifest_without_alert_kinds_does_not_mention_them():
+    assert "alert_kinds" not in Capabilities().to_dict()
+
+
+def test_set_alerts_publishes_the_whole_list_retained():
+    plugin = _make_plugin()
+    mock = _attach_mock_client(plugin)
+    plugin.set_alerts("wled_1", [PluginAlert("firmware_update", "out", key="17.0.0")])
+    mock.publish.assert_called_once_with(
+        "homecore/devices/wled_1/alerts",
+        json.dumps([{"topic": "firmware_update", "key": "17.0.0", "reason": "out"}]),
+        qos=1,
+        retain=True,
+    )
+
+
+def test_set_plugin_alerts_publishes_to_the_plugin_topic():
+    plugin = _make_plugin()
+    mock = _attach_mock_client(plugin)
+    plugin.set_plugin_alerts([PluginAlert("login_expired", "The login expired")])
+    topic, payload, retain = _published(mock)[0]
+    assert topic == "homecore/plugins/plugin.test/alerts"
+    assert json.loads(payload) == [{"topic": "login_expired", "reason": "The login expired"}]
+    assert retain
+
+
+def test_an_empty_list_clears_and_is_published_and_forgotten():
+    plugin = _make_plugin()
+    mock = _attach_mock_client(plugin)
+    plugin.set_alerts("wled_1", [PluginAlert("firmware_update", "out")])
+    plugin.set_alerts("wled_1", [])
+    # The empty list goes out — it is what clears the retained message.
+    assert _published(mock)[-1] == ("homecore/devices/wled_1/alerts", "[]", True)
+    assert plugin._alerts == {}
+
+
+def test_the_last_list_per_topic_is_held():
+    plugin = _make_plugin()
+    _attach_mock_client(plugin)
+    plugin.set_alerts("a", [PluginAlert("k", "first")])
+    plugin.set_alerts("a", [PluginAlert("k", "second")])
+    plugin.set_alerts("b", [PluginAlert("k", "other")])
+    plugin.set_plugin_alerts([PluginAlert("p", "mine")])
+    assert {t: json.loads(p)[0]["reason"] for t, p in plugin._alerts.items()} == {
+        "homecore/devices/a/alerts": "second",
+        "homecore/devices/b/alerts": "other",
+        "homecore/plugins/plugin.test/alerts": "mine",
+    }
+
+
+def _fake_paho(client: MagicMock) -> dict:
+    """Just enough of paho for run() to build its client and return."""
+    mod = types.ModuleType("paho.mqtt.client")
+    mod.CallbackAPIVersion = types.SimpleNamespace(VERSION2=2)
+    mod.MQTTv311 = 4
+    mod.Client = lambda *a, **k: client
+    mqtt_pkg = types.ModuleType("paho.mqtt")
+    mqtt_pkg.client = mod
+    paho_pkg = types.ModuleType("paho")
+    paho_pkg.mqtt = mqtt_pkg
+    return {"paho": paho_pkg, "paho.mqtt": mqtt_pkg, "paho.mqtt.client": mod}
+
+
+def test_held_alerts_are_said_again_on_every_reconnect():
+    """A restarted core's broker has forgotten its retained messages; an alert
+    set an hour ago must not vanish because core did."""
+    plugin = _make_plugin()
+    client = MagicMock()
+    with patch.dict(sys.modules, _fake_paho(client)):
+        plugin.run()  # loop_forever is a mock, so this returns at once
+
+    # Set before the connect callback has fired: whatever became of that
+    # publish, the list is held, so the connect says it again.
+    plugin.set_alerts("wled_1", [PluginAlert("firmware_update", "out")])
+    plugin.set_alerts("gone", [PluginAlert("x", "y")])
+    plugin.set_alerts("gone", [])
+    client.publish.reset_mock()
+
+    for _ in range(2):  # first connect, then a reconnect
+        client.on_connect(client, None, None, 0, None)
+    alert_publishes = [p for p in _published(client) if p[0].endswith("/alerts")]
+    assert alert_publishes == [
+        ("homecore/devices/wled_1/alerts", json.dumps([{"topic": "firmware_update", "reason": "out"}]), True)
+    ] * 2
