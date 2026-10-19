@@ -456,11 +456,16 @@ zombies with `DELETE /api/v1/plugins/{id}/devices`.
 
 ## Parity with the Rust SDK
 
-Everything the Rust SDK does is here: registration, state, availability, the
+Almost everything the Rust SDK does is here: registration, state, availability, the
 management protocol, log forwarding, notices, alerts, capability actions including
 streaming, cross-device state subscription, and the plugin's own screens.
 
-Everything the Rust SDK does is here. There is no gap left.
+One thing is Rust-only so far: **files sent to an action** (`POST
+/plugins/{id}/upload/{action}`, which the Rust SDK receives as `upload_chunk`
+pieces and hands the action as `file_path`).
+
+The whole process of building a plugin — screens and cards included — is in
+the homeCore repository's `docs/plugin-development.md`.
 
 ## Development
 
