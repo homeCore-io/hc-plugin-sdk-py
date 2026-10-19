@@ -1219,3 +1219,192 @@ def test_held_alerts_are_said_again_on_every_reconnect():
     assert alert_publishes == [
         ("homecore/devices/wled_1/alerts", json.dumps([{"topic": "firmware_update", "reason": "out"}]), True)
     ] * 2
+
+
+# ----------------------------------------------------------------------
+# The plugin's own screens
+# ----------------------------------------------------------------------
+
+from homecore_plugin_sdk import ui as hc_ui  # noqa: E402
+
+#: The build of the shared fixture below. Every homeCore SDK pins this same
+#: value — it is what plugin_sdk_rs::ui::load gives for these two files — so
+#: one UI folder has one address whichever SDK serves it.
+FIXTURE_BUILD = "6695a38681c3d6e7"
+FIXTURE_MANIFEST = '{"host_api":1,"slots":[{"slot":"plugin.page","element":"hc-x-page"}]}'
+
+
+def _ui_folder(tmp_path) -> str:
+    (tmp_path / "manifest.json").write_bytes(FIXTURE_MANIFEST.encode())
+    (tmp_path / "index.js").write_bytes(b"export {}")
+    return str(tmp_path)
+
+
+def test_the_build_is_the_one_every_sdk_computes(tmp_path):
+    assert hc_ui.load(_ui_folder(tmp_path), "1.2.3").build == FIXTURE_BUILD
+
+
+def test_a_ui_folder_is_declared_with_a_build_that_changes_with_its_files(tmp_path):
+    d = _ui_folder(tmp_path)
+    a = hc_ui.load(d, "1.2.3")
+    assert (a.version, a.entry, a.host_api) == ("1.2.3", "index.js", 1)
+    assert len(a.build) == 16
+    (tmp_path / "index.js").write_bytes(b"export const x = 1")
+    assert hc_ui.load(d, "1.2.3").build != a.build
+    # A file in a subfolder counts too.
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "a.css").write_bytes(b"")
+    assert hc_ui.load(d, "1.2.3").build != hc_ui.build_of(str(tmp_path / "assets"))
+
+
+def test_a_folder_without_its_entry_or_a_manifest_offers_nothing(tmp_path):
+    with pytest.raises(hc_ui.UiError):
+        hc_ui.load(str(tmp_path), "1")
+    (tmp_path / "manifest.json").write_text('{"host_api":1,"slots":[]}')
+    with pytest.raises(hc_ui.UiError):
+        hc_ui.load(str(tmp_path), "1")
+    (tmp_path / "index.js").write_text("export {}")
+    with pytest.raises(hc_ui.UiError, match="nowhere"):
+        hc_ui.load(str(tmp_path), "1")
+
+
+def test_a_ui_keeps_the_slots_the_app_knows_and_drops_the_rest():
+    ui = hc_ui.PluginUi(
+        host_api=1,
+        version="0.1.18",
+        slots=[
+            hc_ui.UiSlot("plugin.page", "hc-ecowitt-page"),
+            hc_ui.UiSlot("device.panel", "hc-ecowitt-station", ["weather_station"]),
+            hc_ui.UiSlot("dashboard.card", "hc-ecowitt-card"),
+            hc_ui.UiSlot("plugin.page", "NoHyphen"),
+        ],
+    ).validated()
+    assert ui is not None and len(ui.slots) == 2
+    assert ui.slots[1].device_types == ["weather_station"]
+    page = [hc_ui.UiSlot("plugin.page", "hc-x-page")]
+    assert hc_ui.PluginUi(1, "1.0.0", entry="index.js", slots=page).validated()
+    assert hc_ui.PluginUi(1, "1.0.0", entry="../index.js", slots=page).validated() is None
+    assert hc_ui.PluginUi(1, "1.0.0", entry="/etc/index.js", slots=page).validated() is None
+    assert hc_ui.PluginUi(1, " ", slots=page).validated() is None
+    assert hc_ui.PluginUi(1, "1.0.0", slots=[]).validated() is None
+
+
+def test_the_manifest_ui_is_the_rust_wire_form():
+    ui = hc_ui.PluginUi(
+        1, "1.0.0", "abc", "index.js",
+        [hc_ui.UiSlot("plugin.page", "hc-x-page"), hc_ui.UiSlot("device.panel", "hc-x-p", ["light"])],
+    )
+    assert ui.to_dict() == {
+        "host_api": 1,
+        "version": "1.0.0",
+        "build": "abc",
+        "entry": "index.js",
+        "slots": [
+            {"slot": "plugin.page", "element": "hc-x-page"},
+            {"slot": "device.panel", "element": "hc-x-p", "device_types": ["light"]},
+        ],
+    }
+
+
+def test_relative_paths_stay_inside_the_folder():
+    for ok in ("index.js", "a/b.js", "./x.js"):
+        assert hc_ui.relative_path(ok), ok
+    for bad in ("", "/etc/passwd", "../x", "a/../../x", "a//b", "a\\b", "a/"):
+        assert not hc_ui.relative_path(bad), bad
+
+
+def test_files_go_in_pieces_and_never_from_outside_the_folder(tmp_path):
+    (tmp_path / "index.js").write_bytes(b"abcdefghij")
+    d = str(tmp_path)
+    assert hc_ui.piece(d, "index.js", 0, 4) == (b"abcd", False)
+    assert hc_ui.piece(d, "index.js", 8, 4) == (b"ij", True)
+    assert hc_ui.piece(d, "index.js", 6, 4) == (b"ghij", True)
+    assert hc_ui.piece(d, "index.js", 50, 4) == (b"", True)
+    for bad in ("../etc/passwd", "missing.js", "/etc/passwd"):
+        with pytest.raises(hc_ui.UiError, match="^no such file$"):
+            hc_ui.piece(d, bad, 0, 4)
+
+
+def test_find_dir_prefers_the_env_then_the_package_then_the_source_tree(tmp_path, monkeypatch):
+    monkeypatch.delenv("HC_PLUGIN_UI_DIR", raising=False)
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "elsewhere" / "run.py")])
+    project = tmp_path / "proj"
+    pkg = project / "my_plugin"
+    pkg.mkdir(parents=True)
+    (project / "pyproject.toml").write_text("")
+    module = str(pkg / "__init__.py")
+    assert hc_ui.find_dir(module) is None
+    # A folder without a manifest doesn't count.
+    (project / "ui" / "dist").mkdir(parents=True)
+    assert hc_ui.find_dir(module) is None
+    (project / "ui" / "dist" / "manifest.json").write_text("{}")
+    assert hc_ui.find_dir(module) == str(project / "ui" / "dist")
+    (pkg / "ui").mkdir()
+    (pkg / "ui" / "manifest.json").write_text("{}")
+    assert hc_ui.find_dir(module) == str(pkg / "ui")
+    assert hc_ui.find_dir(str(pkg)) == str(pkg / "ui")
+    monkeypatch.setenv("HC_PLUGIN_UI_DIR", "/somewhere")
+    assert hc_ui.find_dir(module) == "/somewhere"
+
+
+def test_with_ui_dir_puts_ui_on_the_manifest_even_with_no_actions(tmp_path):
+    plugin = _make_plugin()
+    mock = _attach_mock_client(plugin)
+    assert plugin.with_ui_dir(_ui_folder(tmp_path), "2.0.0") is plugin
+    plugin._publish_capabilities()
+    caps = [p for p in _published(mock) if p[0].endswith("/capabilities")]
+    assert len(caps) == 1 and caps[0][2] is True
+    m = json.loads(caps[0][1])
+    assert m["plugin_id"] == "plugin.test" and m["actions"] == []
+    assert m["ui"] == {
+        "host_api": 1,
+        "version": "2.0.0",
+        "build": FIXTURE_BUILD,
+        "entry": "index.js",
+        "slots": [{"slot": "plugin.page", "element": "hc-x-page"}],
+    }
+
+
+def test_with_ui_dir_on_a_missing_folder_offers_no_ui(tmp_path, caplog):
+    plugin = _make_plugin()
+    mock = _attach_mock_client(plugin)
+    with caplog.at_level("WARNING"):
+        plugin.with_ui_dir(str(tmp_path / "nope"), "1.0.0")
+    assert "No plugin UI offered" in caplog.text
+    plugin._publish_capabilities()
+    assert not [p for p in _published(mock) if p[0].endswith("/capabilities")]
+    plugin._handle_manage_cmd(_manage_msg("ui_file", file="index.js"))
+    assert _responses(mock) == [
+        {"request_id": "r1", "status": "error", "error": "no such file: this plugin serves no UI"}
+    ]
+
+
+def test_ui_file_serves_pieces_in_base64(tmp_path):
+    import base64
+
+    plugin = _make_plugin()
+    mock = _attach_mock_client(plugin)
+    d = _ui_folder(tmp_path)
+    (tmp_path / "big.js").write_bytes(bytes(range(256)) * 1024)  # 256 KiB
+    plugin.with_ui_dir(d, "1.0.0")
+
+    plugin._handle_manage_cmd(_manage_msg("ui_file", "a", file="index.js"))
+    plugin._handle_manage_cmd(_manage_msg("ui_file", "b", file="index.js", offset=8, max=1))
+    plugin._handle_manage_cmd(_manage_msg("ui_file", "c", file="big.js"))
+    plugin._handle_manage_cmd(_manage_msg("ui_file", "d", file="big.js", max=10**9))
+    plugin._handle_manage_cmd(_manage_msg("ui_file", "e", file="big.js", max=0))
+    plugin._handle_manage_cmd(_manage_msg("ui_file", "f", file="../manifest.json"))
+    plugin._handle_manage_cmd(_manage_msg("ui_file", "g", file="nope.js"))
+    r = {x["request_id"]: x for x in _responses(mock)}
+
+    assert r["a"] == {
+        "request_id": "a", "status": "ok",
+        "data": base64.b64encode(b"export {}").decode(), "done": True,
+    }
+    assert base64.b64decode(r["b"]["data"]) == b"}" and r["b"]["done"] is True
+    # max defaults to 128 KiB, and is clamped to [1, 160 KiB].
+    assert len(base64.b64decode(r["c"]["data"])) == 131072 and r["c"]["done"] is False
+    assert len(base64.b64decode(r["d"]["data"])) == 163840 and r["d"]["done"] is False
+    assert len(base64.b64decode(r["e"]["data"])) == 1
+    assert r["f"] == {"request_id": "f", "status": "error", "error": "no such file"}
+    assert r["g"] == {"request_id": "g", "status": "error", "error": "no such file"}

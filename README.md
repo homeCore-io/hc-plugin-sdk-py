@@ -295,6 +295,43 @@ def on_state(self, device_id, state):
 This needs a broader broker ACL than a normal plugin:
 `allow_sub = ["homecore/devices/+/state"]`.
 
+## Your own screens
+
+A plugin can carry web components — a page for itself, a panel for its devices
+— and serve them itself. Build them into a folder with one ES module and a
+`manifest.json` saying where each goes, ship the folder inside your package as
+`ui/` (package data), and:
+
+```python
+from homecore_plugin_sdk import ui
+
+def on_connect(self):
+    d = ui.find_dir(__file__)
+    if d:
+        self.with_ui_dir(d, __version__)
+    self.enable_management(version=__version__, capabilities=caps)
+```
+
+`ui.find_dir(__file__)` looks, in order, at `HC_PLUGIN_UI_DIR`; `ui/` inside
+the package `__file__` belongs to (how a wheel installs it); `ui/` beside the
+program being run (`sys.argv[0]`); and, run from a source checkout,
+`<project>/ui/dist`, where `<project>` is the nearest folder above the package
+with a `pyproject.toml`. Apart from the environment variable, a folder counts
+only if it holds `manifest.json`.
+
+The SDK declares them on the manifest (`ui`, with a hash of the files as their
+`build`) and answers homeCore's requests for the files; homeCore passes them to
+the web app and keeps none. A plugin with screens and no actions still
+publishes its manifest. A folder that isn't there, or declares nowhere the app
+can put it, is said in the log and skipped — the app shows its generic screens.
+Each element is handed the app's `host` — the plugin's devices, commands,
+actions, settings and the app's look; its types are `core/sdk/ui`
+(`@homecore/plugin-ui`). `plugins/hc-ecowitt/ui` in core is a complete one.
+
+The `build` is the same in every homeCore SDK for the same folder: the first 8
+bytes of SHA-256 over every file, sorted by path, each fed as its path, a 0
+byte and its contents.
+
 ## API reference
 
 ### Devices
@@ -329,6 +366,7 @@ caused the change, so the UI and the audit log can say so.
 | Method | Purpose |
 |---|---|
 | `enable_management(interval_secs=, version=, config_path=, capabilities=)` | Heartbeat, remote management, action manifest |
+| `with_ui_dir(dir, version)` | Carry and serve the plugin's own screens |
 | `enable_log_forwarding(min_level=)` | Send your logs to homeCore's live log stream |
 | `publish_plugin_status(status)` | active / degraded / offline |
 | `publish_event(type, payload)` | A structured event on the bus |
@@ -417,7 +455,7 @@ zombies with `DELETE /api/v1/plugins/{id}/devices`.
 
 Everything the Rust SDK does is here: registration, state, availability, the
 management protocol, log forwarding, notices, alerts, capability actions including
-streaming, and cross-device state subscription.
+streaming, cross-device state subscription, and the plugin's own screens.
 
 Everything the Rust SDK does is here. There is no gap left.
 

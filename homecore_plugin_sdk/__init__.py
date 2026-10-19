@@ -40,6 +40,7 @@ Constructor parameters override environment variables, which override defaults:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -58,6 +59,8 @@ from .alerts import (
 from .capabilities import Action, Capabilities, Concurrency, ItemOp, RequiresRole
 from .notices import NoticeLevel, PluginNotice, PluginNotices
 from .persistence import DeviceTracker, ReconcileReport, scoped_snapshot_path
+from . import ui as ui
+from .ui import PluginUi, UiError, UiSlot
 from .streaming import StreamContext, StreamTerminated
 
 __all__ = [
@@ -73,6 +76,11 @@ __all__ = [
     "AlertAction",
     "AlertActionTarget",
     "AlertSeverity",
+    # The plugin's own screens
+    "PluginUi",
+    "UiSlot",
+    "UiError",
+    "ui",
     # Capability actions
     "Capabilities",
     "Action",
@@ -89,7 +97,7 @@ __all__ = [
 #: This SDK's version, reported in every heartbeat. Informational — it tells an
 #: operator which SDK to rebuild against; it is not what core checks
 #: compatibility on.
-SDK_VERSION = "0.4.0"
+SDK_VERSION = "0.5.0"
 
 #: The wire protocol this SDK speaks, which is core's `hc-types` version. Core
 #: compares it against its own to decide whether the two agree on the shape of
@@ -97,6 +105,14 @@ SDK_VERSION = "0.4.0"
 PROTOCOL_VERSION = "0.1.5"
 
 logger = logging.getLogger(__name__)
+
+
+def _u64(v: Any, default: int) -> int:
+    """*v* when it is a whole number that is not negative, else *default* —
+    what serde_json's ``as_u64`` gives the Rust SDK."""
+    if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**64:
+        return v
+    return default
 
 
 class PluginBase(ABC):
@@ -149,6 +165,10 @@ class PluginBase(ABC):
         self._alerts_lock = threading.Lock()
 
         self._capabilities: Capabilities | None = None
+        # The plugin's own screens, when it carries them: what the manifest
+        # declares, and the folder the files are served from.
+        self._ui: PluginUi | None = None
+        self._ui_dir: str | None = None
         self._active_streams: dict[str, StreamContext] = {}
         self._streams_lock = threading.Lock()
 
@@ -673,6 +693,35 @@ class PluginBase(ABC):
         )
         t.start()
 
+    def with_ui_dir(self, directory: str, version: str) -> "PluginBase":
+        """Carry and serve the plugin's own screens: the built UI folder
+        *directory* (its ``manifest.json`` says where each component goes).
+
+        They are declared on the manifest under *version* — the plugin's — with
+        a hash of the files as their ``build``, and served from *directory*
+        when homeCore asks; homeCore passes them through to the app and keeps
+        none.
+
+        A folder that isn't there, or offers nothing, is said in the log and
+        skipped — the app then shows its generic screens. Call it before
+        :meth:`enable_management`; returns the plugin, so it chains::
+
+            d = ui.find_dir(__file__)
+            if d:
+                self.with_ui_dir(d, __version__)
+        """
+        try:
+            loaded = ui.load(directory, version)
+        except UiError as exc:
+            logger.warning("No plugin UI offered (%s): %s", directory, exc)
+            return self
+        logger.info("Serving the plugin's own UI from %s (build %s)", directory, loaded.build)
+        self._ui = loaded
+        self._ui_dir = directory
+        if self._management_enabled:
+            self._publish_capabilities()
+        return self
+
     def _on_notices_changed(self) -> None:
         """Push a heartbeat as soon as the notice set changes.
 
@@ -711,12 +760,18 @@ class PluginBase(ABC):
         without it a late-joining core would never learn the plugin has actions
         until the plugin happened to reconnect.
         """
-        if self._capabilities is None:
+        # A plugin with screens but no actions still needs the manifest: the
+        # `ui` rides on it.
+        if self._capabilities is None and self._ui is None:
             return
-        self._capabilities.plugin_id = self.PLUGIN_ID
+        caps = self._capabilities if self._capabilities is not None else Capabilities()
+        caps.plugin_id = self.PLUGIN_ID
+        manifest = caps.to_dict()
+        if self._ui is not None:
+            manifest["ui"] = self._ui.to_dict()
         self._publish(
             f"homecore/plugins/{self.PLUGIN_ID}/capabilities",
-            json.dumps(self._capabilities.to_dict()),
+            json.dumps(manifest),
             qos=1,
             retain=True,
         )
@@ -974,6 +1029,8 @@ class PluginBase(ABC):
                 json.dumps({"request_id": request_id, "status": "ok"}),
                 qos=1,
             )
+        elif action == "ui_file":
+            self._handle_ui_file(payload, request_id)
         elif action == "get_config":
             if not self._config_path:
                 self._respond(request_id, error="no config path configured")
@@ -1035,6 +1092,25 @@ class PluginBase(ABC):
 
         else:
             self._dispatch_action(action, request_id, payload)
+
+    def _handle_ui_file(self, payload: dict, request_id: str) -> None:
+        """A piece of one of the UI's files, for homeCore to pass on."""
+        if self._ui_dir is None:
+            self._respond(request_id, error="no such file: this plugin serves no UI")
+            return
+        file = payload.get("file")
+        file = file if isinstance(file, str) else ""
+        offset = _u64(payload.get("offset"), 0)
+        max_bytes = min(max(_u64(payload.get("max"), 128 * 1024), 1), 160 * 1024)
+        try:
+            data, done = ui.piece(self._ui_dir, file, offset, max_bytes)
+        except UiError as exc:
+            self._respond(request_id, error=str(exc))
+            return
+        self._respond(
+            request_id,
+            extra={"data": base64.b64encode(data).decode("ascii"), "done": done},
+        )
 
     def _handle_set_config(self, payload: dict, request_id: str) -> None:
         """Write a ``set_config`` payload.
