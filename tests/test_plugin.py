@@ -60,10 +60,10 @@ class TestPublishMethods(unittest.TestCase):
     def test_publish_state(self):
         plugin = _make_plugin()
         mc = _attach_mock_client(plugin)
-        plugin.publish_state("light.01", {"on": True, "brightness": 200})
+        plugin.publish_state("light.01", {"on": True, "brightness_pct": 80})
         mc.publish.assert_called_once_with(
             "homecore/devices/light.01/state",
-            json.dumps({"on": True, "brightness": 200}),
+            json.dumps({"on": True, "brightness_pct": 80}),
             qos=1,
             retain=True,
         )
@@ -91,10 +91,10 @@ class TestPublishMethods(unittest.TestCase):
     def test_publish_state_partial(self):
         plugin = _make_plugin()
         mc = _attach_mock_client(plugin)
-        plugin.publish_state_partial("light.01", {"brightness": 128})
+        plugin.publish_state_partial("light.01", {"brightness_pct": 50})
         mc.publish.assert_called_once_with(
             "homecore/devices/light.01/state/partial",
-            json.dumps({"brightness": 128}),
+            json.dumps({"brightness_pct": 50}),
             qos=1,
             retain=False,
         )

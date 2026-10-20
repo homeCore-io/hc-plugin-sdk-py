@@ -11,7 +11,7 @@ device registration, and state publishing.  Subclass it to implement a plugin:
         PLUGIN_ID = "plugin.my_light"
 
         def on_connect(self):
-            caps = {"on": {"type": "boolean"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 255}}
+            caps = {"on": {"type": "boolean"}, "brightness_pct": {"type": "number", "minimum": 0, "maximum": 100}}
             self.register_device("light.01", "My Light", caps)
             self.publish_availability("light.01", True)
             self.publish_plugin_status("active")
@@ -97,7 +97,7 @@ __all__ = [
 #: This SDK's version, reported in every heartbeat. Informational — it tells an
 #: operator which SDK to rebuild against; it is not what core checks
 #: compatibility on.
-SDK_VERSION = "0.5.1"
+SDK_VERSION = "0.5.2"
 
 #: The wire protocol this SDK speaks, which is core's `hc-types` version. Core
 #: compares it against its own to decide whether the two agree on the shape of
