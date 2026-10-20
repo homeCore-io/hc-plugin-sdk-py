@@ -49,7 +49,7 @@ class MyLight(PluginBase):
         # Register here, not in __init__ — this runs again after a reconnect.
         self.register_device_full("light.01", "Desk Lamp", device_type="light")
         self.publish_availability("light.01", True)
-        self.publish_state("light.01", {"on": False, "brightness": 0})
+        self.publish_state("light.01", {"on": False, "brightness_pct": 0})
 
     def on_command(self, device_id, payload):
         # Do whatever the real device needs, then publish what actually
@@ -75,7 +75,7 @@ your device  ←→  your plugin  ──state──▶  homeCore  ──▶  rul
                               ◀──cmd────
 ```
 
-Three consequences worth internalising:
+Four consequences worth internalising:
 
 1. **Publish what happened, not what was asked.** A command is a request. If
    the bulb refuses, publish the state it is actually in. That is why the UI
@@ -84,6 +84,16 @@ Three consequences worth internalising:
    re-registers and re-subscribes.
 3. **You only see your own devices.** Registering a device subscribes to that
    device's command topic and nothing else.
+4. **Use homeCore's names and units.** A shared idea has one name, one unit:
+   `on`, `brightness_pct` (0–100), `color_temp` (kelvin), `transition_ms`,
+   `open` (`true` = open), `occupied`, `battery_pct`, `humidity`,
+   `illuminance` (lux), temperatures in **°C**, and the rest of the table in
+   `core/crates/hc-types/src/device_vocabulary.rs`. Convert from the device's
+   own scale inside the plugin, both ways; showing °F is the app's job. A
+   command arrives as one of two shapes — an attribute write, `{"on": true}`,
+   or a declared action, `{"action": "toggle"}` — never `{"command": …}`.
+   `{"on": true}` restores the last level. See "Names and units" in
+   `core/docs/plugin-development.md`.
 
 ## Installing it into homeCore
 
