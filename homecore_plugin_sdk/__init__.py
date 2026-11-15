@@ -60,6 +60,7 @@ from .capabilities import Action, Capabilities, Concurrency, ItemOp, RequiresRol
 from .notices import NoticeLevel, PluginNotice, PluginNotices
 from .persistence import DeviceTracker, ReconcileReport, scoped_snapshot_path
 from . import ui as ui
+from . import supervised as supervised
 from .ui import PluginUi, UiError, UiSlot
 from .streaming import StreamContext, StreamTerminated
 
@@ -877,6 +878,7 @@ class PluginBase(ABC):
 
     def run(self) -> None:
         """Connect to the broker and block until interrupted."""
+        supervised.watch(self.PLUGIN_ID)
         try:
             import paho.mqtt.client as mqtt
         except ImportError as exc:
