@@ -60,11 +60,17 @@ class RequiresRole(str, Enum):
 
     homeCore enforces this; it is not a UI hint. Use ``ADMIN`` for anything
     destructive — unregistering devices, clearing pairings, factory resets.
+
+    ``SIGNED_IN`` is the only level that opens an action to people without
+    ``plugins:write``: anyone signed in to homeCore, household members and
+    read-only accounts included. The handler gets the verified ``caller`` and
+    must limit what it does to the caller's own scopes.
     """
 
     ADMIN = "admin"
     USER = "user"
     READ_ONLY = "read_only"
+    SIGNED_IN = "signed_in"
 
 
 class ItemOp(str, Enum):

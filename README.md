@@ -307,9 +307,10 @@ def on_action(self, action, params, ctx=None, caller=None):
         return {"name": (caller or {}).get("username")}
 ```
 
-An action declared with `requires_role=RequiresRole.USER` can be called by any
-signed-in person whose role allows it, so use `caller["scopes"]` to stay within
-what that person may do.
+Most actions still need an admin (`plugins:write`), whatever role they declare.
+An action declared with `requires_role=RequiresRole.SIGNED_IN` can be called by
+anyone signed in, household members and read-only accounts included, so use
+`caller["scopes"]` to stay within what that person may do.
 
 ## REST access from homeCore
 
