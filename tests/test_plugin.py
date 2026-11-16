@@ -1686,3 +1686,18 @@ class TestStreamData(unittest.TestCase):
         self.assertEqual(events[1]["data"], {"kind": "confirm"})
         self.assertEqual(events[1]["response_schema"], {"type": "object"})
         self.assertNotIn("data", events[2])
+
+
+class TestStreamTimestamps(unittest.TestCase):
+    def test_every_event_has_a_later_ts_than_the_last(self):
+        """A reader may drop an event whose ts repeats; back to back events
+        must never share one."""
+        plugin = ActionPlugin(broker_host="127.0.0.1", broker_port=1883)
+        mock = _attach_mock_client(plugin)
+        ctx = StreamContext(plugin, "r1", "chat")
+        for i in range(200):
+            ctx.progress(data={"kind": "text", "delta": str(i)})
+        ctx.complete({})
+        stamps = [e["ts"] for e in _stream_events(mock)]
+        self.assertEqual(len(stamps), len(set(stamps)))
+        self.assertEqual(stamps, sorted(stamps))

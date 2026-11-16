@@ -47,14 +47,11 @@ import json
 import logging
 import queue
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class StreamTerminated(RuntimeError):
@@ -88,6 +85,8 @@ class StreamContext:
         self._terminal = threading.Event()
         self._canceled = threading.Event()
         self._responses: queue.Queue = queue.Queue()
+        self._last_ts: datetime | None = None
+        self._ts_lock = threading.Lock()
 
     # ── non-terminal stages ───────────────────────────────────────────────
 
@@ -216,10 +215,25 @@ class StreamContext:
         if terminal:
             self._terminal.set()
         ev["request_id"] = self.request_id
-        ev["ts"] = _iso_now()
+        ev["ts"] = self._next_ts()
         # Retained, so a UI that subscribes mid-action still sees the latest
         # frame rather than an empty screen until the next one.
         self._plugin._publish(self.topic, json.dumps(ev), qos=1, retain=True)
+
+    def _next_ts(self) -> str:
+        """Now, but always later than this stream's previous event.
+
+        Events emitted back to back (a chat's text as it is written) can fall
+        in the same microsecond, and a reader that drops an event whose ``ts``
+        it has already seen would lose one. So each is at least a microsecond
+        after the last.
+        """
+        with self._ts_lock:
+            now = datetime.now(timezone.utc)
+            if self._last_ts is not None and now <= self._last_ts:
+                now = self._last_ts + timedelta(microseconds=1)
+            self._last_ts = now
+        return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def _finalize(self, error: BaseException | None) -> None:
         """Guarantee exactly one terminal stage, then clear the retained topic.
@@ -240,7 +254,7 @@ class StreamContext:
                     {
                         "stage": "error",
                         "request_id": self.request_id,
-                        "ts": _iso_now(),
+                        "ts": self._next_ts(),
                         "message": message,
                         "data": {"reason": "plugin_dropped_stream"},
                     }
