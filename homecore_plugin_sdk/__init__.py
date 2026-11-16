@@ -44,6 +44,7 @@ import base64
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -158,6 +159,7 @@ class PluginBase(ABC):
         # persistence is enabled — survives a restart so reconcile_devices can
         # tell what has since disappeared.
         self._devices = DeviceTracker()
+        self._stopping = False
 
         # The alerts last published, by topic, so a reconnect can say them
         # again: core's broker forgets retained messages when it restarts, and
@@ -808,6 +810,37 @@ class PluginBase(ABC):
         re-registers them. Call :meth:`enable_management` here too.
         """
 
+    def on_stop(self) -> None:
+        """Called once when the plugin is stopping, before it says goodbye.
+
+        Leave what you control safe here (turn off a heater you were running,
+        close a session). Your devices are marked offline after this returns.
+        """
+
+    def stop(self) -> None:
+        """Stop: every registered device offline, the plugin offline, then
+        disconnect, which ends :meth:`run`.
+
+        Called on SIGTERM (how homeCore and a plugin runtime stop a plugin) and
+        on Ctrl-C, so a stopped plugin's devices read offline at once rather
+        than showing their last state as if nothing had happened. Safe to call
+        more than once.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
+        try:
+            self.on_stop()
+        except Exception:  # noqa: BLE001 - stopping must not fail on a hook
+            logger.exception("on_stop raised; stopping anyway")
+        for device_id in sorted(self._devices.snapshot()):
+            self.publish_availability(device_id, False)
+        self.publish_plugin_status("offline")
+        logger.info("Plugin %s stopped; its devices are offline", self.PLUGIN_ID)
+        if self._client is not None:
+            # Queued after the messages above, so they go out first.
+            self._client.disconnect()
+
     def on_action(
         self,
         action: str,
@@ -937,9 +970,21 @@ class PluginBase(ABC):
         client.on_message = _on_message
         client.on_disconnect = _on_disconnect
 
+        # SIGTERM is how homeCore and a plugin runtime stop a plugin. Python's
+        # default ends the process on the spot, leaving every device "online"
+        # with its last state. Signal handlers can only be set from the main
+        # thread; a plugin run from another thread calls stop() itself.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, lambda _sig, _frame: self.stop())
+
         client.connect(self.broker_host, self.broker_port, keepalive=60)
         logger.info("Plugin %s entering event loop", self.PLUGIN_ID)
-        client.loop_forever()
+        try:
+            client.loop_forever()
+        except KeyboardInterrupt:
+            self.stop()
+            # Let the goodbye messages and DISCONNECT go out.
+            client.loop_forever()
 
     # ------------------------------------------------------------------
     # Internal helpers
