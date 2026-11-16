@@ -388,6 +388,7 @@ caused the change, so the UI and the audit log can say so.
 | `set_plugin_alerts(alerts)` | The same, about the plugin itself |
 | `enable_device_persistence(path)` | Remember registered devices across restarts |
 | `reconcile_devices(live)` | Unregister everything not in the live set |
+| `stop()` | `on_stop()`, every device offline, the plugin offline, disconnect |
 
 ### Hooks to override
 
@@ -398,6 +399,13 @@ caused the change, so the UI and the audit log can say so.
 | `on_action(action, params, ctx=None)` | A capability action |
 | `on_state(device_id, state)` | A device you subscribed to changed |
 | `on_set_config(config)` | A structured config write |
+| `on_stop()` | Stopping. Leave what you control safe |
+
+**Stopping.** homeCore and a plugin runtime stop a plugin with SIGTERM, and
+kill it 2 seconds later. When `run()` is called from the main thread, SIGTERM
+and Ctrl-C call `stop()`: your `on_stop()`, then every registered device
+offline, the plugin offline, and a disconnect, which ends `run()`. A plugin
+run from another thread calls `stop()` itself.
 
 ## Secrets in logs
 
