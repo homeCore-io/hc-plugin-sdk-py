@@ -1426,3 +1426,44 @@ def test_ui_file_serves_pieces_in_base64(tmp_path):
     assert len(base64.b64decode(r["e"]["data"])) == 1
     assert r["f"] == {"request_id": "f", "status": "error", "error": "no such file"}
     assert r["g"] == {"request_id": "g", "status": "error", "error": "no such file"}
+
+
+def test_stop_marks_every_device_offline_then_disconnects():
+    plugin = _make_plugin()
+    client = _attach_mock_client(plugin)
+    plugin.register_device("light.b", "B", {})
+    plugin.register_device("light.a", "A", {})
+    client.reset_mock()
+    stopped = []
+    plugin.on_stop = lambda: stopped.append(True)
+
+    plugin.stop()
+
+    published = [(c.args[0], c.args[1]) for c in client.publish.call_args_list]
+    assert published == [
+        ("homecore/devices/light.a/availability", "offline"),
+        ("homecore/devices/light.b/availability", "offline"),
+        (f"homecore/plugins/{plugin.PLUGIN_ID}/status", "offline"),
+    ]
+    assert stopped == [True], "the plugin's own hook runs first"
+    client.disconnect.assert_called_once()
+
+    # A second SIGTERM, or stop() after Ctrl-C, says nothing again.
+    plugin.stop()
+    client.disconnect.assert_called_once()
+
+
+def test_a_failing_on_stop_still_marks_devices_offline():
+    plugin = _make_plugin()
+    client = _attach_mock_client(plugin)
+    plugin.register_device("light.a", "A", {})
+    client.reset_mock()
+
+    def boom():
+        raise RuntimeError("hook failed")
+
+    plugin.on_stop = boom
+    plugin.stop()
+    topics = [c.args[0] for c in client.publish.call_args_list]
+    assert "homecore/devices/light.a/availability" in topics
+    client.disconnect.assert_called_once()
