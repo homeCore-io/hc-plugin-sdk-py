@@ -160,6 +160,13 @@ class Capabilities:
     #: turn it on or off — before it ever happens. Raise them with
     #: :meth:`~homecore_plugin_sdk.PluginBase.set_alerts`.
     alert_kinds: list[PluginAlertKind] = field(default_factory=list)
+    #: REST scopes the plugin needs from homeCore's API (``devices:read``,
+    #: ``devices:command``, ...). When this is not empty, homeCore mints the
+    #: plugin its own API key on every start and hands it over with the
+    #: ``api_access`` management action; see
+    #: :meth:`~homecore_plugin_sdk.PluginBase.on_api_access`. Nothing to paste
+    #: and nothing stored in the plugin's config.
+    api_scopes: list[str] = field(default_factory=list)
     spec: str = "1"
     plugin_id: str = ""
 
@@ -173,6 +180,8 @@ class Capabilities:
         # extracts them from this payload.
         if self.alert_kinds:
             out["alert_kinds"] = [k.to_dict() for k in self.alert_kinds]
+        if self.api_scopes:
+            out["api_scopes"] = list(self.api_scopes)
         if self.config_schema is not None:
             out["config_schema"] = self.config_schema
         if self.config_descriptor is not None:

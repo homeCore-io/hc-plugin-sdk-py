@@ -41,6 +41,7 @@ Constructor parameters override environment variables, which override defaults:
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ import signal
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any
 
 from .alerts import (
@@ -92,6 +94,8 @@ __all__ = [
     # Streaming actions
     "StreamContext",
     "StreamTerminated",
+    # REST access core grants the plugin
+    "ApiAccess",
     # Device persistence
     "ReconcileReport",
 ]
@@ -99,7 +103,7 @@ __all__ = [
 #: This SDK's version, reported in every heartbeat. Informational — it tells an
 #: operator which SDK to rebuild against; it is not what core checks
 #: compatibility on.
-SDK_VERSION = "0.5.4"
+SDK_VERSION = "0.5.5"
 
 #: The wire protocol this SDK speaks, which is core's `hc-types` version. Core
 #: compares it against its own to decide whether the two agree on the shape of
@@ -115,6 +119,25 @@ def _u64(v: Any, default: int) -> int:
     if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**64:
         return v
     return default
+
+
+@dataclass(frozen=True)
+class ApiAccess:
+    """REST access homeCore granted this plugin with the ``api_access``
+    management action: where its API is, the key to use, and what the key
+    may do.
+
+    The key is minted fresh on every plugin start and kept only in memory;
+    it never appears in ``repr`` so it cannot leak into a log line.
+    """
+
+    #: homeCore's REST base this plugin can reach, e.g.
+    #: ``http://127.0.0.1:8080/api/v1``.
+    url: str
+    #: Bearer key (``hc_sk_...``).
+    key: str = field(repr=False)
+    #: Scopes the key carries. Can be fewer than the manifest asked for.
+    scopes: list[str] = field(default_factory=list)
 
 
 class PluginBase(ABC):
@@ -174,6 +197,9 @@ class PluginBase(ABC):
         self._ui_dir: str | None = None
         self._active_streams: dict[str, StreamContext] = {}
         self._streams_lock = threading.Lock()
+        # REST access from core, once it has sent it (see on_api_access).
+        self._api_access: ApiAccess | None = None
+        self._api_access_ready = threading.Event()
 
     # ------------------------------------------------------------------
     # Public API
@@ -779,6 +805,25 @@ class PluginBase(ABC):
             retain=True,
         )
 
+    @property
+    def api_access(self) -> ApiAccess | None:
+        """The REST access homeCore granted, or ``None`` until it arrives.
+
+        Only a plugin whose manifest declares
+        :attr:`Capabilities.api_scopes` is sent one.
+        """
+        return self._api_access
+
+    def wait_for_api_access(self, timeout: float | None = None) -> ApiAccess | None:
+        """Block until homeCore has sent REST access, or *timeout* seconds
+        pass. Returns the access, or ``None`` on timeout.
+
+        Don't call it from :meth:`on_connect`: the access arrives on the same
+        MQTT loop thread, which would then be blocked waiting for itself.
+        """
+        self._api_access_ready.wait(timeout)
+        return self._api_access
+
     def enable_log_forwarding(self, min_level: str = "INFO") -> None:
         """Attach an MQTT log handler to the root logger.
 
@@ -853,6 +898,13 @@ class PluginBase(ABC):
         a :class:`~homecore_plugin_sdk.streaming.StreamContext` — report
         through it and return ``None``.
 
+        **Who called.** homeCore says who made each request:
+        ``{"uid", "username", "role", "scopes", "kind"}``. A streaming action
+        reads it as ``ctx.caller``. For an immediate action, add a ``caller``
+        keyword to your override (``def on_action(self, action, params,
+        ctx=None, caller=None)``) and the SDK passes it; overrides without one
+        are called as before.
+
         Returning ``None`` from an *immediate* action tells the SDK you do not
         recognise the id, and it answers with ``unknown action``.
 
@@ -860,6 +912,16 @@ class PluginBase(ABC):
         and will not stall the MQTT loop.
         """
         return None
+
+    def on_api_access(self, url: str, key: str, scopes: list[str]) -> None:
+        """homeCore has sent this plugin REST access: its API base *url*, a
+        bearer *key*, and the *scopes* the key carries.
+
+        Arrives after every start (the key is reminted each time, and the old
+        one revoked), so replace whatever client you built from the last one.
+        Runs on the MQTT loop thread: keep it quick. The default does nothing;
+        :attr:`api_access` holds the same values either way.
+        """
 
     def on_set_config(self, config) -> bool:
         """Accept a structured ``set_config`` payload.
@@ -1095,6 +1157,8 @@ class PluginBase(ABC):
 
         elif action == "set_config":
             self._handle_set_config(payload, request_id)
+        elif action == "api_access":
+            self._handle_api_access(payload, request_id)
         elif action == "cancel":
             target = payload.get("target_request_id")
             with self._streams_lock:
@@ -1159,6 +1223,29 @@ class PluginBase(ABC):
             extra={"data": base64.b64encode(data).decode("ascii"), "done": done},
         )
 
+    def _handle_api_access(self, payload: dict, request_id: str) -> None:
+        """Keep the REST access core sent and tell the plugin.
+
+        Core sends the fields at the top level of the management payload; a
+        nested ``params`` object is accepted too.
+        """
+        body = payload.get("params") if isinstance(payload.get("params"), dict) else payload
+        url = body.get("url")
+        key = body.get("key")
+        scopes = body.get("scopes")
+        if not isinstance(url, str) or not url or not isinstance(key, str) or not key:
+            self._respond(request_id, error="api_access needs a url and a key")
+            return
+        scopes = [str(s) for s in scopes] if isinstance(scopes, list) else []
+        self._api_access = ApiAccess(url=url.rstrip("/"), key=key, scopes=scopes)
+        self._api_access_ready.set()
+        logger.info("homeCore granted REST access at %s (%d scopes)", url, len(scopes))
+        try:
+            self.on_api_access(self._api_access.url, key, scopes)
+        except Exception:  # noqa: BLE001 - a plugin bug must not kill the loop
+            logger.exception("on_api_access raised")
+        self._respond(request_id)
+
     def _handle_set_config(self, payload: dict, request_id: str) -> None:
         """Write a ``set_config`` payload.
 
@@ -1215,19 +1302,24 @@ class PluginBase(ABC):
     def _dispatch_action(self, action: str, request_id: str, payload: dict) -> None:
         """Route a management command that is not a built-in to :meth:`on_action`."""
         declared = self._declared_action(action)
-        # Params are everything that is not protocol envelope.
+        # Params are everything that is not protocol envelope. `caller` is
+        # who core verified made the request; it is never a param.
         params = {
             k: v
             for k, v in payload.items()
-            if k not in ("action", "request_id", "target_request_id")
+            if k not in ("action", "request_id", "target_request_id", "caller")
         }
+        caller = payload.get("caller") if isinstance(payload.get("caller"), dict) else None
 
         if declared is not None and declared.stream:
-            self._start_stream(declared, request_id, params)
+            self._start_stream(declared, request_id, params, caller)
             return
 
         try:
-            result = self.on_action(action, params, None)
+            if self._on_action_takes_caller():
+                result = self.on_action(action, params, None, caller=caller)
+            else:
+                result = self.on_action(action, params, None)
         except Exception as exc:  # noqa: BLE001 - a plugin bug must not kill the loop
             logger.exception("action %s raised", action)
             self._respond(request_id, error=f"action failed: {exc}")
@@ -1238,7 +1330,28 @@ class PluginBase(ABC):
         else:
             self._respond(request_id, extra=result)
 
-    def _start_stream(self, declared: Action, request_id: str, params: dict) -> None:
+    def _on_action_takes_caller(self) -> bool:
+        """Whether this plugin's :meth:`on_action` accepts ``caller=``.
+
+        Older plugins override it with ``(action, params, ctx=None)``; they
+        keep working, they just do not hear who called.
+        """
+        try:
+            sig = inspect.signature(self.on_action)
+        except (TypeError, ValueError):
+            return False
+        return any(
+            p.name == "caller" or p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+
+    def _start_stream(
+        self,
+        declared: Action,
+        request_id: str,
+        params: dict,
+        caller: dict | None = None,
+    ) -> None:
         """Run a streaming action on its own thread and answer ``accepted``."""
         if not request_id:
             self._respond("", error="streaming action requires request_id")
@@ -1260,7 +1373,7 @@ class PluginBase(ABC):
                 )
                 return
 
-        ctx = StreamContext(self, request_id, declared.id)
+        ctx = StreamContext(self, request_id, declared.id, caller=caller)
         with self._streams_lock:
             self._active_streams[request_id] = ctx
 

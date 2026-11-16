@@ -1467,3 +1467,207 @@ def test_a_failing_on_stop_still_marks_devices_offline():
     topics = [c.args[0] for c in client.publish.call_args_list]
     assert "homecore/devices/light.a/availability" in topics
     client.disconnect.assert_called_once()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Who called, and the REST access core grants
+# ──────────────────────────────────────────────────────────────────────────
+
+CALLER = {
+    "uid": "0b6f4c1e-0000-4000-8000-000000000001",
+    "username": "sam",
+    "role": "household_member",
+    "scopes": ["devices:read"],
+    "kind": "user",
+}
+
+
+class CallerPlugin(ConcretePlugin):
+    """Overrides on_action with the new ``caller`` keyword."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.calls: list = []
+
+    def on_action(self, action, params, ctx=None, caller=None):
+        self.calls.append((action, params, ctx, caller))
+        if action == "who":
+            return {"caller": caller}
+        if action == "chat":
+            ctx.complete({"caller": ctx.caller, "params": params})
+        return None
+
+
+class TestCaller(unittest.TestCase):
+    def _plugin(self, cls):
+        plugin = cls(broker_host="127.0.0.1", broker_port=1883)
+        mock = _attach_mock_client(plugin)
+        plugin.enable_management(
+            interval_secs=3600,
+            capabilities=Capabilities(
+                actions=[
+                    Action(id="who", label="Who"),
+                    Action(id="immediate", label="Immediate"),
+                    Action(id="chat", label="Chat", stream=True),
+                ]
+            ),
+        )
+        return plugin, mock
+
+    def test_caller_is_passed_to_a_handler_that_accepts_it(self):
+        plugin, mock = self._plugin(CallerPlugin)
+        plugin._on_message_handler(_manage_msg("who", caller=CALLER, text="hi"))
+        resp = _responses(mock)[-1]
+        self.assertEqual(resp["caller"], CALLER)
+        # It is never a param.
+        self.assertEqual(plugin.calls[-1][1], {"text": "hi"})
+
+    def test_old_style_handler_still_works_and_never_sees_caller(self):
+        plugin, mock = self._plugin(ActionPlugin)
+        plugin._on_message_handler(_manage_msg("immediate", caller=CALLER, value=1))
+        resp = _responses(mock)[-1]
+        self.assertEqual(resp["status"], "ok")
+        self.assertEqual(resp["echo"], {"value": 1})
+
+    def test_missing_caller_is_none(self):
+        plugin, mock = self._plugin(CallerPlugin)
+        plugin._on_message_handler(_manage_msg("who"))
+        self.assertIsNone(_responses(mock)[-1]["caller"])
+
+    def test_a_non_object_caller_is_ignored(self):
+        plugin, mock = self._plugin(CallerPlugin)
+        plugin._on_message_handler(_manage_msg("who", caller="admin"))
+        self.assertIsNone(_responses(mock)[-1]["caller"])
+
+    def test_streaming_handler_reads_ctx_caller(self):
+        plugin, mock = self._plugin(CallerPlugin)
+        plugin._on_message_handler(_manage_msg("chat", caller=CALLER, text="hi"))
+        for t in threading.enumerate():
+            if t.name.startswith("hc-action-"):
+                t.join(timeout=5)
+        done = [e for e in _stream_events(mock) if e["stage"] == "complete"][-1]
+        self.assertEqual(done["data"]["caller"], CALLER)
+        self.assertEqual(done["data"]["params"], {"text": "hi"})
+
+    def test_kwargs_override_counts_as_accepting_caller(self):
+        class Kw(ConcretePlugin):
+            def on_action(self, action, params, ctx=None, **kw):
+                return {"caller": kw.get("caller")}
+
+        plugin, mock = self._plugin(Kw)
+        plugin._on_message_handler(_manage_msg("who", caller=CALLER))
+        self.assertEqual(_responses(mock)[-1]["caller"], CALLER)
+
+
+class AccessPlugin(ConcretePlugin):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.granted: list = []
+
+    def on_api_access(self, url, key, scopes):
+        self.granted.append((url, key, scopes))
+
+
+class TestApiAccess(unittest.TestCase):
+    def _plugin(self, cls=AccessPlugin, scopes=None):
+        plugin = cls(broker_host="127.0.0.1", broker_port=1883)
+        mock = _attach_mock_client(plugin)
+        plugin.enable_management(
+            interval_secs=3600,
+            capabilities=Capabilities(api_scopes=scopes or []),
+        )
+        return plugin, mock
+
+    def _manifest(self, mock):
+        for c in mock.publish.call_args_list:
+            if c[0][0].endswith("/capabilities"):
+                return json.loads(c[0][1])
+        raise AssertionError("no manifest")
+
+    def test_api_scopes_ride_on_the_manifest_only_when_set(self):
+        _, mock = self._plugin(scopes=["devices:read", "devices:command"])
+        self.assertEqual(
+            self._manifest(mock)["api_scopes"], ["devices:read", "devices:command"]
+        )
+        _, mock = self._plugin()
+        self.assertNotIn("api_scopes", self._manifest(mock))
+
+    def test_api_access_is_kept_and_the_hook_called(self):
+        plugin, mock = self._plugin()
+        self.assertIsNone(plugin.api_access)
+        plugin._on_message_handler(
+            _manage_msg(
+                "api_access",
+                url="http://127.0.0.1:8080/api/v1/",
+                key="hc_sk_abc",
+                scopes=["devices:read"],
+            )
+        )
+        self.assertEqual(_responses(mock)[-1]["status"], "ok")
+        self.assertEqual(plugin.api_access.url, "http://127.0.0.1:8080/api/v1")
+        self.assertEqual(plugin.api_access.key, "hc_sk_abc")
+        self.assertEqual(plugin.api_access.scopes, ["devices:read"])
+        self.assertEqual(
+            plugin.granted, [("http://127.0.0.1:8080/api/v1", "hc_sk_abc", ["devices:read"])]
+        )
+        self.assertIs(plugin.wait_for_api_access(0), plugin.api_access)
+
+    def test_the_key_never_shows_in_repr(self):
+        plugin, _ = self._plugin()
+        plugin._on_message_handler(
+            _manage_msg("api_access", url="http://h/api/v1", key="hc_sk_secret", scopes=[])
+        )
+        self.assertNotIn("hc_sk_secret", repr(plugin.api_access))
+
+    def test_a_reminted_key_replaces_the_old_one(self):
+        plugin, _ = self._plugin()
+        for key in ("hc_sk_1", "hc_sk_2"):
+            plugin._on_message_handler(
+                _manage_msg("api_access", url="http://h/api/v1", key=key, scopes=[])
+            )
+        self.assertEqual(plugin.api_access.key, "hc_sk_2")
+        self.assertEqual(len(plugin.granted), 2)
+
+    def test_nested_params_are_accepted(self):
+        plugin, _ = self._plugin()
+        plugin._on_message_handler(
+            _manage_msg(
+                "api_access", params={"url": "http://h/api/v1", "key": "k", "scopes": ["a"]}
+            )
+        )
+        self.assertEqual(plugin.api_access.scopes, ["a"])
+
+    def test_missing_key_is_an_error_and_keeps_nothing(self):
+        plugin, mock = self._plugin()
+        plugin._on_message_handler(_manage_msg("api_access", url="http://h/api/v1"))
+        self.assertEqual(_responses(mock)[-1]["status"], "error")
+        self.assertIsNone(plugin.api_access)
+        self.assertIsNone(plugin.wait_for_api_access(0.01))
+
+    def test_wait_returns_once_access_arrives_from_another_thread(self):
+        plugin, _ = self._plugin()
+
+        def later():
+            plugin._on_message_handler(
+                _manage_msg("api_access", url="http://h/api/v1", key="k", scopes=[])
+            )
+
+        t = threading.Timer(0.05, later)
+        t.start()
+        got = plugin.wait_for_api_access(5)
+        t.join()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.key, "k")
+
+    def test_a_hook_that_raises_does_not_break_the_reply(self):
+        class Bad(ConcretePlugin):
+            def on_api_access(self, url, key, scopes):
+                raise RuntimeError("boom")
+
+        plugin, mock = self._plugin(cls=Bad)
+        with self.assertLogs("homecore_plugin_sdk", level="ERROR"):
+            plugin._on_message_handler(
+                _manage_msg("api_access", url="http://h/api/v1", key="k", scopes=[])
+            )
+        self.assertEqual(_responses(mock)[-1]["status"], "ok")
+        self.assertIsNotNone(plugin.api_access)

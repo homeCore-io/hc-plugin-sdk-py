@@ -68,10 +68,20 @@ class StreamContext:
     and have each report progress.
     """
 
-    def __init__(self, plugin: Any, request_id: str, action_id: str) -> None:
+    def __init__(
+        self,
+        plugin: Any,
+        request_id: str,
+        action_id: str,
+        caller: dict | None = None,
+    ) -> None:
         self._plugin = plugin
         self.request_id = request_id
         self.action_id = action_id
+        #: Who started this action, as homeCore verified them:
+        #: ``{"uid", "username", "role", "scopes", "kind"}``. ``None`` when the
+        #: homeCore that sent it is too old to say.
+        self.caller = caller
         self.topic = (
             f"homecore/plugins/{plugin.PLUGIN_ID}/commands/{request_id}/events"
         )
