@@ -97,8 +97,13 @@ class StreamContext:
         percent: int | None = None,
         label: str | None = None,
         message: str | None = None,
+        data: dict | None = None,
     ) -> None:
-        """Report progress. Every field is optional — send whichever you have."""
+        """Report progress. Every field is optional — send whichever you have.
+
+        *data* carries anything a plugin's own screen reads from the stream
+        (a chat's text as it is written, say); the generic UI ignores it.
+        """
         ev: dict = {"stage": "progress"}
         if percent is not None:
             ev["percent"] = int(percent)
@@ -106,6 +111,8 @@ class StreamContext:
             ev["label"] = label
         if message is not None:
             ev["message"] = message
+        if data is not None:
+            ev["data"] = data
         self._emit(ev, terminal=False)
 
     def item_add(self, data: dict) -> None:
@@ -132,16 +139,24 @@ class StreamContext:
             ev["data"] = data
         self._emit(ev, terminal=False)
 
-    def awaiting_user(self, prompt: str, response_schema: dict | None = None) -> None:
+    def awaiting_user(
+        self,
+        prompt: str,
+        response_schema: dict | None = None,
+        data: dict | None = None,
+    ) -> None:
         """Ask the operator for something and keep the stream open.
 
         Emit this, then block on :meth:`await_respond`. Z-Wave inclusion is the
         motivating case: the plugin cannot proceed until somebody physically
-        presses a button.
+        presses a button. *data* is for a plugin's own screen: what to show
+        with the question (a preview of a change, say).
         """
         ev: dict = {"stage": "awaiting_user", "prompt": prompt}
         if response_schema is not None:
             ev["response_schema"] = response_schema
+        if data is not None:
+            ev["data"] = data
         self._emit(ev, terminal=False)
 
     # ── terminal stages ───────────────────────────────────────────────────

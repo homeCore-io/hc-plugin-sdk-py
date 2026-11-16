@@ -289,6 +289,10 @@ ctx.awaiting_user("Press the pairing button on the device now.")
 answer = ctx.await_respond(timeout=60)
 ```
 
+`progress` and `awaiting_user` also take `data=`, a dict a plugin's own screen
+reads from the stream (text as it is written, a preview to confirm). The
+generic UI ignores it.
+
 ### Who called
 
 homeCore passes the verified caller with every action: `{"uid", "username",

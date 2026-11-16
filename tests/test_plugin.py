@@ -1671,3 +1671,18 @@ class TestApiAccess(unittest.TestCase):
             )
         self.assertEqual(_responses(mock)[-1]["status"], "ok")
         self.assertIsNotNone(plugin.api_access)
+
+
+class TestStreamData(unittest.TestCase):
+    def test_progress_and_awaiting_user_carry_data(self):
+        plugin = ActionPlugin(broker_host="127.0.0.1", broker_port=1883)
+        mock = _attach_mock_client(plugin)
+        ctx = StreamContext(plugin, "r1", "chat")
+        ctx.progress(data={"kind": "text", "delta": "Hi"})
+        ctx.awaiting_user("Turn off 3 lights", {"type": "object"}, data={"kind": "confirm"})
+        ctx.progress(message="plain")
+        events = _stream_events(mock)
+        self.assertEqual(events[0]["data"], {"kind": "text", "delta": "Hi"})
+        self.assertEqual(events[1]["data"], {"kind": "confirm"})
+        self.assertEqual(events[1]["response_schema"], {"type": "object"})
+        self.assertNotIn("data", events[2])
