@@ -289,6 +289,54 @@ ctx.awaiting_user("Press the pairing button on the device now.")
 answer = ctx.await_respond(timeout=60)
 ```
 
+`progress` and `awaiting_user` also take `data=`, a dict a plugin's own screen
+reads from the stream (text as it is written, a preview to confirm). The
+generic UI ignores it.
+
+### Who called
+
+homeCore passes the verified caller with every action: `{"uid", "username",
+"role", "scopes", "kind"}` (`kind` is `user`, `api_key`, `local_admin` or
+`whitelist`). It is never mixed into `params`. A streaming handler reads
+`ctx.caller`; an immediate one adds a `caller` keyword and the SDK passes it.
+Handlers written without it keep working.
+
+```python
+def on_action(self, action, params, ctx=None, caller=None):
+    if action == "whoami":
+        return {"name": (caller or {}).get("username")}
+```
+
+Most actions still need an admin (`plugins:write`), whatever role they declare.
+An action declared with `requires_role=RequiresRole.SIGNED_IN` can be called by
+anyone signed in, household members and read-only accounts included, so use
+`caller["scopes"]` to stay within what that person may do.
+
+## REST access from homeCore
+
+A plugin that needs homeCore's REST API asks for scopes in its manifest, and
+homeCore mints it a key on every start. Nothing to paste, nothing stored in the
+config file.
+
+```python
+Capabilities(actions=[...], api_scopes=["devices:read", "devices:command"])
+```
+
+The key arrives with the `api_access` management action. The SDK keeps it in
+`self.api_access` (`url`, `key`, `scopes`; the key never shows in `repr`) and
+calls your hook:
+
+```python
+def on_api_access(self, url, key, scopes):
+    self.rest = MyClient(url, key)      # url already ends in /api/v1
+
+# or, from a worker thread (never from on_connect):
+access = self.wait_for_api_access(timeout=30)
+```
+
+homeCore leaves out scopes no plugin may hold (`users:write`,
+`api_keys:admin`), so check `scopes` rather than assuming you got everything.
+
 ## Cross-device plugins
 
 To read devices you do **not** own — a thermostat consuming sensors from other
@@ -388,6 +436,8 @@ caused the change, so the UI and the audit log can say so.
 | `set_plugin_alerts(alerts)` | The same, about the plugin itself |
 | `enable_device_persistence(path)` | Remember registered devices across restarts |
 | `reconcile_devices(live)` | Unregister everything not in the live set |
+| `stop()` | `on_stop()`, every device offline, the plugin offline, disconnect |
+| `api_access` / `wait_for_api_access(timeout)` | REST access homeCore granted, or `None` |
 
 ### Hooks to override
 
@@ -395,9 +445,17 @@ caused the change, so the UI and the audit log can say so.
 |---|---|
 | `on_connect()` | Connected. Register devices, enable management |
 | `on_command(device_id, payload)` | A command for one of your devices |
-| `on_action(action, params, ctx=None)` | A capability action |
+| `on_action(action, params, ctx=None, caller=None)` | A capability action; `caller` is optional |
 | `on_state(device_id, state)` | A device you subscribed to changed |
 | `on_set_config(config)` | A structured config write |
+| `on_api_access(url, key, scopes)` | homeCore sent REST access (every start) |
+| `on_stop()` | Stopping. Leave what you control safe |
+
+**Stopping.** homeCore and a plugin runtime stop a plugin with SIGTERM, and
+kill it 2 seconds later. When `run()` is called from the main thread, SIGTERM
+and Ctrl-C call `stop()`: your `on_stop()`, then every registered device
+offline, the plugin offline, and a disconnect, which ends `run()`. A plugin
+run from another thread calls `stop()` itself.
 
 ## Secrets in logs
 

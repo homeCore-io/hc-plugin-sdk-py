@@ -47,14 +47,11 @@ import json
 import logging
 import queue
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class StreamTerminated(RuntimeError):
@@ -68,16 +65,28 @@ class StreamContext:
     and have each report progress.
     """
 
-    def __init__(self, plugin: Any, request_id: str, action_id: str) -> None:
+    def __init__(
+        self,
+        plugin: Any,
+        request_id: str,
+        action_id: str,
+        caller: dict | None = None,
+    ) -> None:
         self._plugin = plugin
         self.request_id = request_id
         self.action_id = action_id
+        #: Who started this action, as homeCore verified them:
+        #: ``{"uid", "username", "role", "scopes", "kind"}``. ``None`` when the
+        #: homeCore that sent it is too old to say.
+        self.caller = caller
         self.topic = (
             f"homecore/plugins/{plugin.PLUGIN_ID}/commands/{request_id}/events"
         )
         self._terminal = threading.Event()
         self._canceled = threading.Event()
         self._responses: queue.Queue = queue.Queue()
+        self._last_ts: datetime | None = None
+        self._ts_lock = threading.Lock()
 
     # ── non-terminal stages ───────────────────────────────────────────────
 
@@ -87,8 +96,13 @@ class StreamContext:
         percent: int | None = None,
         label: str | None = None,
         message: str | None = None,
+        data: dict | None = None,
     ) -> None:
-        """Report progress. Every field is optional — send whichever you have."""
+        """Report progress. Every field is optional — send whichever you have.
+
+        *data* carries anything a plugin's own screen reads from the stream
+        (a chat's text as it is written, say); the generic UI ignores it.
+        """
         ev: dict = {"stage": "progress"}
         if percent is not None:
             ev["percent"] = int(percent)
@@ -96,6 +110,8 @@ class StreamContext:
             ev["label"] = label
         if message is not None:
             ev["message"] = message
+        if data is not None:
+            ev["data"] = data
         self._emit(ev, terminal=False)
 
     def item_add(self, data: dict) -> None:
@@ -122,16 +138,24 @@ class StreamContext:
             ev["data"] = data
         self._emit(ev, terminal=False)
 
-    def awaiting_user(self, prompt: str, response_schema: dict | None = None) -> None:
+    def awaiting_user(
+        self,
+        prompt: str,
+        response_schema: dict | None = None,
+        data: dict | None = None,
+    ) -> None:
         """Ask the operator for something and keep the stream open.
 
         Emit this, then block on :meth:`await_respond`. Z-Wave inclusion is the
         motivating case: the plugin cannot proceed until somebody physically
-        presses a button.
+        presses a button. *data* is for a plugin's own screen: what to show
+        with the question (a preview of a change, say).
         """
         ev: dict = {"stage": "awaiting_user", "prompt": prompt}
         if response_schema is not None:
             ev["response_schema"] = response_schema
+        if data is not None:
+            ev["data"] = data
         self._emit(ev, terminal=False)
 
     # ── terminal stages ───────────────────────────────────────────────────
@@ -191,10 +215,25 @@ class StreamContext:
         if terminal:
             self._terminal.set()
         ev["request_id"] = self.request_id
-        ev["ts"] = _iso_now()
+        ev["ts"] = self._next_ts()
         # Retained, so a UI that subscribes mid-action still sees the latest
         # frame rather than an empty screen until the next one.
         self._plugin._publish(self.topic, json.dumps(ev), qos=1, retain=True)
+
+    def _next_ts(self) -> str:
+        """Now, but always later than this stream's previous event.
+
+        Events emitted back to back (a chat's text as it is written) can fall
+        in the same microsecond, and a reader that drops an event whose ``ts``
+        it has already seen would lose one. So each is at least a microsecond
+        after the last.
+        """
+        with self._ts_lock:
+            now = datetime.now(timezone.utc)
+            if self._last_ts is not None and now <= self._last_ts:
+                now = self._last_ts + timedelta(microseconds=1)
+            self._last_ts = now
+        return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def _finalize(self, error: BaseException | None) -> None:
         """Guarantee exactly one terminal stage, then clear the retained topic.
@@ -215,7 +254,7 @@ class StreamContext:
                     {
                         "stage": "error",
                         "request_id": self.request_id,
-                        "ts": _iso_now(),
+                        "ts": self._next_ts(),
                         "message": message,
                         "data": {"reason": "plugin_dropped_stream"},
                     }
