@@ -5,11 +5,19 @@ A plugin for an imaginary hub. It has nothing to control until the hub is
 discovered, which is the situation notices exist for: without one it would sit
 there looking healthy and doing nothing.
 
-Run it against a homeCore::
+Run it against a homeCore. Install the SDK from its GitHub tag (nothing is on
+PyPI yet), then pass the config file homeCore wrote for the plugin, the same
+way homeCore starts it::
 
-    pip install homecore-plugin-sdk
-    python discovery_plugin.py
-    HC_BROKER_HOST=10.0.0.5 python discovery_plugin.py
+    pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.5.5
+    python discovery_plugin.py /path/to/plugin.discovery_demo.toml
+
+For a try without homeCore, write that file's ``[homecore]`` table yourself::
+
+    [homecore]
+    broker_host = "127.0.0.1"
+    broker_port = 1883
+    plugin_id   = "plugin.discovery_demo"
 
 Then, in the web UI, open Plugins → Discovery Demo and you will see:
 
@@ -39,8 +47,8 @@ logging.basicConfig(
 logger = logging.getLogger("discovery_plugin")
 
 # Stand-ins for a real network sweep.
-CANDIDATE_HOSTS = [f"10.0.0.{n}" for n in range(10, 16)]
-HUBS_THAT_ANSWER = {"10.0.0.12": "HUB-A1B2"}
+CANDIDATE_HOSTS = [f"192.168.1.{n}" for n in range(10, 16)]
+HUBS_THAT_ANSWER = {"192.168.1.12": "HUB-A1B2"}
 
 
 class DiscoveryPlugin(PluginBase):
@@ -108,12 +116,14 @@ class DiscoveryPlugin(PluginBase):
         if action == "ping_hub":
             return {"reachable": self.hub_host in HUBS_THAT_ANSWER}
         if action == "forget_hub":
+            # The result is merged into the response, whose "status" says
+            # whether the action succeeded, so the result can't use that key.
             if self.hub_host is None:
-                return {"status": "nothing to forget"}
+                return {"outcome": "nothing to forget"}
             self.unregister_device(f"hub_{HUBS_THAT_ANSWER[self.hub_host]}")
             self.hub_host = None
             self._refresh_notices()
-            return {"status": "forgotten"}
+            return {"outcome": "forgotten"}
         return None  # not ours — the SDK answers "unknown action"
 
     def _discover(self, ctx) -> None:
@@ -185,4 +195,4 @@ class DiscoveryPlugin(PluginBase):
 
 
 if __name__ == "__main__":
-    DiscoveryPlugin().run()
+    DiscoveryPlugin.from_config().run()
