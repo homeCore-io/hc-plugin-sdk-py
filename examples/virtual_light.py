@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""virtual_light.py — A software-only dimmable light plugin for HomeCore.
+"""virtual_light.py — A software-only dimmable light plugin for homeCore.
 
 Simulates a dimmable light bulb.  On startup it registers with the broker,
 publishes its initial state, then toggles on/off and steps brightness every

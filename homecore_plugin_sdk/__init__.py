@@ -1,4 +1,4 @@
-"""homecore_plugin_sdk — Python SDK for HomeCore device plugins.
+"""homecore_plugin_sdk — Python SDK for homeCore device plugins.
 
 Provides :class:`PluginBase`, a base class that handles broker connection,
 device registration, and state publishing.  Subclass it to implement a plugin:
@@ -141,7 +141,7 @@ class ApiAccess:
 
 
 class PluginBase(ABC):
-    """Base class for HomeCore plugins written in Python.
+    """Base class for homeCore plugins written in Python.
 
     Subclasses must set :attr:`PLUGIN_ID` and implement :meth:`on_command`.
     Call :meth:`run` to connect and enter the event loop.
@@ -303,7 +303,7 @@ class PluginBase(ABC):
     ) -> None:
         """Publish a full device state update (retained, QoS 1).
 
-        :param device_id: The canonical HomeCore device identifier.
+        :param device_id: The canonical homeCore device identifier.
         :param state: Dict of attribute names → values.
         :param change: Optional ``_hc.change`` provenance payload.
         """
@@ -326,7 +326,7 @@ class PluginBase(ABC):
 
         Use this for high-frequency sensors that send diffs rather than full state blobs.
 
-        :param device_id: The canonical HomeCore device identifier.
+        :param device_id: The canonical homeCore device identifier.
         :param patch: Dict of attributes to merge into the current state.
         :param change: Optional ``_hc.change`` provenance payload.
         """
@@ -346,7 +346,7 @@ class PluginBase(ABC):
         *,
         fallback_source: str | None = None,
     ) -> None:
-        """Publish a full state update caused by a HomeCore command."""
+        """Publish a full state update caused by a homeCore command."""
         self.publish_state(
             device_id,
             state,
@@ -364,7 +364,7 @@ class PluginBase(ABC):
         *,
         fallback_source: str | None = None,
     ) -> None:
-        """Publish a partial state update caused by a HomeCore command."""
+        """Publish a partial state update caused by a homeCore command."""
         self.publish_state_partial(
             device_id,
             patch,
@@ -446,7 +446,7 @@ class PluginBase(ABC):
         """Register a device by type name.
 
         Instead of supplying a full capability schema, provide a ``device_type``
-        string that HomeCore resolves against its built-in device-type catalog.
+        string that homeCore resolves against its built-in device-type catalog.
         This is the recommended path for well-known device categories.
 
         Example device types: ``"light"``, ``"switch"``, ``"motion_sensor"``,
@@ -472,10 +472,10 @@ class PluginBase(ABC):
         self._track_device(device_id)
 
     def unregister_device(self, device_id: str) -> None:
-        """Retire a device from HomeCore.
+        """Retire a device from homeCore.
 
         Clears retained state/availability/schema topics and then publishes a
-        plugin-scoped unregister message so HomeCore deletes the stored device.
+        plugin-scoped unregister message so homeCore deletes the stored device.
         """
         self._publish(f"homecore/devices/{device_id}/state", "", qos=1, retain=True)
         self._publish(
@@ -957,7 +957,7 @@ class PluginBase(ABC):
         """
 
     def extract_command_change(self, command_payload: dict) -> dict | None:
-        """Extract ``_hc.command`` metadata from a decoded HomeCore command payload."""
+        """Extract ``_hc.command`` metadata from a decoded homeCore command payload."""
         if not isinstance(command_payload, dict):
             return None
         hc = command_payload.get("_hc")
@@ -974,7 +974,7 @@ class PluginBase(ABC):
         *,
         fallback_source: str | None = None,
     ) -> dict:
-        """Resolve a command payload into a concrete HomeCore-originated change."""
+        """Resolve a command payload into a concrete homeCore-originated change."""
         return self.extract_command_change(command_payload) or {
             "changed_at": self._iso_now(),
             "kind": "homecore",
