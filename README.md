@@ -33,7 +33,7 @@ Nothing is published to PyPI yet. Install from the GitHub tag, which pins you
 to a known release the same way the Rust SDK's git dependency does:
 
 ```bash
-pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.5.5
+pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.5.6
 ```
 
 ## Your first plugin

@@ -9,7 +9,7 @@ Run it against a homeCore. Install the SDK from its GitHub tag (nothing is on
 PyPI yet), then pass the config file homeCore wrote for the plugin, the same
 way homeCore starts it::
 
-    pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.5.5
+    pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.5.6
     python discovery_plugin.py /path/to/plugin.discovery_demo.toml
 
 For a try without homeCore, write that file's ``[homecore]`` table yourself::
