@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import threading
+import time
 import unittest
 
 import pytest
@@ -1701,3 +1702,44 @@ class TestStreamTimestamps(unittest.TestCase):
         stamps = [e["ts"] for e in _stream_events(mock)]
         self.assertEqual(len(stamps), len(set(stamps)))
         self.assertEqual(stamps, sorted(stamps))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Heartbeat across reconnects
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestHeartbeatAcrossReconnects(unittest.TestCase):
+    def _heartbeat_threads(self, plugin):
+        name = f"{plugin.PLUGIN_ID}-heartbeat"
+        return [t for t in threading.enumerate() if t.name == name and t.is_alive()]
+
+    def _beats(self, mock):
+        return [c for c in mock.publish.call_args_list if c[0][0].endswith("/heartbeat")]
+
+    def test_enable_management_on_every_connect_keeps_one_thread(self):
+        plugin = _make_plugin()
+        mock = _attach_mock_client(plugin)
+        # Other tests' plugins share the id and may still be beating.
+        before = set(self._heartbeat_threads(plugin))
+        try:
+            for _ in range(3):  # the first connect and two reconnects
+                plugin.enable_management(interval_secs=3600)
+            started = set(self._heartbeat_threads(plugin)) - before
+            self.assertEqual(len(started), 1)
+            # Each call still beats at once, so core hears from it on reconnect.
+            deadline = time.time() + 2
+            while len(self._beats(mock)) < 3 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(self._beats(mock)), 3)
+        finally:
+            plugin.stop()
+
+    def test_stop_ends_the_heartbeat_thread(self):
+        plugin = _make_plugin()
+        _attach_mock_client(plugin)
+        plugin.enable_management(interval_secs=3600)
+        thread = plugin._heartbeat_thread
+        plugin.stop()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
