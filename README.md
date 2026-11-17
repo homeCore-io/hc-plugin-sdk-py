@@ -29,13 +29,12 @@ edit in `sdks/hc-plugin-sdk-py` is live in your plugin immediately.
 
 ### From a release
 
-```bash
-pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.2.0
-```
+Nothing is published to PyPI yet. Install from the GitHub tag, which pins you
+to a known release the same way the Rust SDK's git dependency does:
 
-**Nothing is published to PyPI**, so there is no `pip install
-homecore-plugin-sdk`. Installing from the tag pins you to a known release the
-same way the Rust SDK's git dependency does.
+```bash
+pip install git+https://github.com/homeCore-io/hc-plugin-sdk-py@v0.5.6
+```
 
 ## Your first plugin
 
@@ -58,12 +57,31 @@ class MyLight(PluginBase):
         self.publish_state_for_command(device_id, state, payload,
                                        fallback_source="mylight")
 
-MyLight().run()
+if __name__ == "__main__":
+    MyLight.from_config().run()
 ```
 
-`run()` blocks. Point it at a broker with constructor arguments, or the
-`HC_BROKER_HOST` / `HC_BROKER_PORT` / `HC_PLUGIN_PASSWORD` environment
-variables.
+homeCore starts a plugin with one argument, the path of its config file, and
+writes a `[homecore]` table into that file:
+
+```toml
+[homecore]
+broker_host = "127.0.0.1"
+broker_port = 1883
+plugin_id   = "plugin.mylight"
+password    = "..."
+```
+
+`from_config()` reads `sys.argv[1]`, connects with those settings, takes
+`plugin_id` as the plugin's id, and remembers the path so
+`enable_management()` can serve the config editor from the same file. Keep
+your own settings in other tables of the same file and read them with
+`read_own_config()`. `run()` blocks.
+
+Constructor arguments and the `HC_BROKER_HOST` / `HC_BROKER_PORT` /
+`HC_PLUGIN_PASSWORD` environment variables are for running a plugin by hand
+without a config file. They don't read `plugin_id` or the minted password, so
+a plugin built that way can't log in to homeCore's broker.
 
 ## How a plugin fits into homeCore
 
@@ -97,21 +115,35 @@ Four consequences worth internalising:
 
 ## Installing it into homeCore
 
-In a normal install you do not copy config files around. homeCore owns your
-plugin's config at `config/plugins/<plugin_id>.toml` and passes the path as
-`sys.argv[1]`:
+homeCore owns your plugin's config at `config/plugins/<plugin_id>.toml` and
+starts the plugin as `<binary> <config path>`. `from_config()` picks the path
+up from `sys.argv[1]`.
 
-```python
-import sys
-config_path = sys.argv[1] if len(sys.argv) > 1 else "config/config.toml"
+Because the config path is the only argument, `binary` has to be something
+that runs your plugin by itself. `/usr/bin/python3` won't work: it would try
+to run the config file as a Python script. Use a console script installed
+into a virtual environment:
+
+```toml
+# your plugin's pyproject.toml
+[project.scripts]
+hc-mylight = "hc_mylight:main"   # main() calls MyLight.from_config().run()
 ```
+
+```bash
+python3 -m venv /opt/hc-mylight
+/opt/hc-mylight/bin/pip install .
+```
+
+A single file with a `#!/usr/bin/env python3` first line, marked executable
+with `chmod +x`, works too.
 
 Declare the plugin in homeCore's `homecore.toml` so it gets supervised:
 
 ```toml
 [[plugins]]
 id      = "plugin.mylight"
-binary  = "/usr/bin/python3"
+binary  = "/opt/hc-mylight/bin/hc-mylight"
 config  = "config/plugins/plugin.mylight.toml"
 enabled = true
 ```
@@ -127,9 +159,12 @@ def on_connect(self):
     self.enable_management(
         interval_secs=60,          # core marks a plugin offline after 90s
         version="1.2.0",
-        config_path=sys.argv[1],
     )
 ```
+
+A plugin built with `from_config()` needs no `config_path`: management serves
+the file it was started with. Pass `config_path=` only to serve a different
+one.
 
 ## Notices — telling the operator what is wrong
 
@@ -227,7 +262,6 @@ from homecore_plugin_sdk import Action, Capabilities
 
 def on_connect(self):
     self.enable_management(
-        config_path=sys.argv[1],
         capabilities=Capabilities(actions=[
             Action(id="rescan", label="Rescan devices",
                    description="Ask the bridge for its current device list."),

@@ -103,7 +103,7 @@ __all__ = [
 #: This SDK's version, reported in every heartbeat. Informational — it tells an
 #: operator which SDK to rebuild against; it is not what core checks
 #: compatibility on.
-SDK_VERSION = "0.5.5"
+SDK_VERSION = "0.5.6"
 
 #: The wire protocol this SDK speaks, which is core's `hc-types` version. Core
 #: compares it against its own to decide whether the two agree on the shape of
@@ -167,6 +167,10 @@ class PluginBase(ABC):
         self._client: Any = None  # paho.mqtt.client.Client
         self._started_at: float = time.time()
         self._management_enabled: bool = False
+        # The one heartbeat thread, however often enable_management is called.
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_interval: float = 60
+        self._heartbeat_stop = threading.Event()
         self._config_path: str | None = None
         self._version: str | None = None
         #: Set by :meth:`from_config`, so :meth:`enable_management` can default
@@ -712,15 +716,24 @@ class PluginBase(ABC):
             )
         self._publish_capabilities()
 
-        def _heartbeat_loop():
-            while True:
-                self._publish_heartbeat()
-                time.sleep(interval_secs)
-
-        t = threading.Thread(
-            target=_heartbeat_loop, daemon=True, name=f"{self.PLUGIN_ID}-heartbeat"
+        # on_connect runs again after every reconnect, and this is called from
+        # there: keep the one heartbeat thread and beat now, rather than
+        # starting another thread per reconnect.
+        self._heartbeat_interval = interval_secs
+        thread = self._heartbeat_thread
+        if thread is not None and thread.is_alive():
+            self._publish_heartbeat()
+            return
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name=f"{self.PLUGIN_ID}-heartbeat"
         )
-        t.start()
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        """Beat now, then every ``_heartbeat_interval`` seconds until stop()."""
+        while not self._heartbeat_stop.is_set():
+            self._publish_heartbeat()
+            self._heartbeat_stop.wait(self._heartbeat_interval)
 
     def with_ui_dir(self, directory: str, version: str) -> "PluginBase":
         """Carry and serve the plugin's own screens: the built UI folder
@@ -874,6 +887,7 @@ class PluginBase(ABC):
         if self._stopping:
             return
         self._stopping = True
+        self._heartbeat_stop.set()
         try:
             self.on_stop()
         except Exception:  # noqa: BLE001 - stopping must not fail on a hook
